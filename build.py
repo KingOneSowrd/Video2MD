@@ -49,6 +49,7 @@ def main():
     print("\n[3] Building EXE...")
     cmd = [
         sys.executable, '-m', 'PyInstaller',
+        '--noconfirm',
         '--onefile',
         '--windowed',
         '--name',         'VideoIngestMonitor',
