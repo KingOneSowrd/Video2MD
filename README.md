@@ -58,7 +58,13 @@ Markdown 示例：
 处理 B站视频需要提供 Cookie（登录态），否则返回 412 错误。
 
 在 GUI 的「Cookie 文件」栏填写 Netscape 格式的 `cookies.txt` 路径即可。
-导出方法：浏览器安装 [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) 扩展，在 B站页面导出。
+
+**导出步骤：**
+
+1. 浏览器安装 [Cookie-Editor](https://cookie-editor.com/) 扩展（支持 Chrome / Edge / Firefox）
+2. 登录 B站后，点击扩展图标
+3. 右下角点「Export」→ 选择格式 **Netscape**
+4. 保存为 `bilibili_cookies.txt`，填入工具的「Cookie 文件」栏
 
 ---
 
