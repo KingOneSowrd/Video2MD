@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -24,16 +27,20 @@ jobs:
       - name: Build EXE
         run: python build.py
 
+      - name: Zip EXE
+        run: Compress-Archive -Path dist\VideoIngestMonitor.exe -DestinationPath dist\VideoIngestMonitor-windows.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoIngestMonitor
-          path: dist/VideoIngestMonitor.exe
+          name: VideoIngestMonitor-windows
+          path: dist/VideoIngestMonitor-windows.zip
           retention-days: 7
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/VideoIngestMonitor.exe
+          files: dist/VideoIngestMonitor-windows.zip
           generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
