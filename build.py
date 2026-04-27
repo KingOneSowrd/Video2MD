@@ -4,8 +4,8 @@ build.py -- PyInstaller build script for VideoIngestMonitor (standalone EXE)
 Usage:
     python build.py
 
-Detects ffmpeg/ffprobe in PATH and bundles them into the EXE automatically.
-Output: dist/VideoIngestMonitor.exe
+Detects ffmpeg/ffprobe in PATH and bundles them automatically.
+Output: dist/VideoIngestMonitor/  (onedir mode, more reliable with native DLLs)
 """
 
 import shutil
@@ -33,38 +33,39 @@ def main():
     print("  Video Ingest Monitor -- PyInstaller Build")
     print("=" * 52)
 
-    # Clean previous build
     print("\n[1] Cleaning previous build...")
     for d in (BUILD_DIR, OUT_DIR):
         if d.exists():
             shutil.rmtree(d)
             print(f"  removed: {d}")
 
-    # Detect ffmpeg/ffprobe
     print("\n[2] Detecting ffmpeg/ffprobe...")
     ffmpeg  = find_binary('ffmpeg')
     ffprobe = find_binary('ffprobe')
 
-    # Build PyInstaller command
-    print("\n[3] Building EXE...")
+    print("\n[3] Building EXE (onedir mode)...")
     cmd = [
         sys.executable, '-m', 'PyInstaller',
         '--noconfirm',
-        '--onefile',
+        '--onedir',                      # 比 --onefile 对 native DLL 更稳定
         '--windowed',
-        '--name',         'VideoIngestMonitor',
-        '--icon',         str(ASSETS_DIR / 'Karby.png'),
-        '--add-data',     str(ASSETS_DIR / 'Karby.png')      + ';assets',
-        '--add-data',     str(ASSETS_DIR / 'Karby_Video.mp4') + ';assets',
-        '--add-data',     str(ASSETS_DIR / 'Karby.gif')       + ';assets',
-        '--collect-all',  'faster_whisper',
-        '--collect-all',  'yt_dlp',
-        '--collect-all',  'ctranslate2',
-        '--hidden-import','PyQt6.QtMultimedia',
-        '--hidden-import','video2md',
-        '--distpath',     str(OUT_DIR),
-        '--workpath',     str(BUILD_DIR),
-        '--specpath',     str(SCRIPT_DIR),
+        '--name',          'VideoIngestMonitor',
+        '--icon',          str(ASSETS_DIR / 'Karby.png'),
+        '--add-data',      str(ASSETS_DIR / 'Karby.png')       + ';assets',
+        '--add-data',      str(ASSETS_DIR / 'Karby_Video.mp4') + ';assets',
+        '--add-data',      str(ASSETS_DIR / 'Karby.gif')       + ';assets',
+        '--collect-all',   'faster_whisper',
+        '--collect-all',   'yt_dlp',
+        '--collect-all',   'ctranslate2',
+        '--collect-all',   'tokenizers',
+        '--copy-metadata', 'faster-whisper',
+        '--copy-metadata', 'ctranslate2',
+        '--copy-metadata', 'tokenizers',
+        '--hidden-import', 'PyQt6.QtMultimedia',
+        '--hidden-import', 'video2md',
+        '--distpath',      str(OUT_DIR),
+        '--workpath',      str(BUILD_DIR),
+        '--specpath',      str(SCRIPT_DIR),
         str(SCRIPT_DIR / 'monitor.py'),
     ]
 
@@ -73,21 +74,21 @@ def main():
     if ffprobe:
         cmd += ['--add-binary', f'{ffprobe};.']
 
+    print("  Running:", ' '.join(cmd[:6]), '...')
     result = subprocess.run(cmd, cwd=str(SCRIPT_DIR))
 
     if result.returncode != 0:
         print("\n[ERROR] Build failed. Check output above.")
         sys.exit(1)
 
-    exe = OUT_DIR / 'VideoIngestMonitor.exe'
+    exe = OUT_DIR / 'VideoIngestMonitor' / 'VideoIngestMonitor.exe'
     print("\n" + "=" * 52)
     print(f"  Done!  {exe}")
+    print(f"  Folder: {OUT_DIR / 'VideoIngestMonitor'}")
     if not ffmpeg:
-        print("  NOTE: ffmpeg was NOT bundled.")
-        print("  Target users must install ffmpeg and add it to PATH.")
-        print("  Download: https://www.gyan.dev/ffmpeg/builds/")
+        print("  NOTE: ffmpeg NOT bundled -- users need it in PATH.")
     else:
-        print("  ffmpeg bundled -- users need nothing extra.")
+        print("  ffmpeg bundled.")
     print("=" * 52)
 
 
