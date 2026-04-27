@@ -22,7 +22,19 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pyqt6 pyqt6-qt6 pyqt6-sip faster-whisper yt-dlp pyinstaller numpy
+        run: |
+          pip install pyqt6 pyqt6-qt6 pyqt6-sip faster-whisper yt-dlp pyinstaller numpy tokenizers sentencepiece
+
+      - name: Verify imports
+        run: |
+          python -c "import ctranslate2; print('ctranslate2', ctranslate2.__version__)"
+          python -c "import faster_whisper; print('faster_whisper OK')"
+          python -c "import yt_dlp; print('yt_dlp OK')"
+          python -c "from PyQt6 import QtCore; print('PyQt6', QtCore.PYQT_VERSION_STR)"
+          python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)"
+
+      - name: Check ffmpeg
+        run: ffmpeg -version | head -1
 
       - name: Build EXE
         run: python build.py
