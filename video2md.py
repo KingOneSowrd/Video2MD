@@ -88,9 +88,9 @@ def _browser_cookie_chain(base_opts: dict) -> list[tuple[dict, str]]:
 
 def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
     """
-    字幕提取专用重试链（与下载链顺序不同）：
-    - YouTube：移动端优先（直接绕过 bot 检测），再试浏览器 Cookie，最后 web
-    - B站：浏览器 Cookie 优先（AI 字幕需要登录态），再试默认
+    字幕提取专用重试链（少即是多，避免触发 429）：
+    - YouTube：移动端(ios/android) → web 默认（共 2 次）
+    - B站：浏览器 Cookie → 默认（AI 字幕需要登录态）
     - 其他：仅默认
     """
     is_yt   = bool(_YT_RE.search(url))
@@ -99,9 +99,7 @@ def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
     if is_yt:
         mobile = {**base_opts,
                   'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}}
-        return ([(mobile, '移动端')]
-                + _browser_cookie_chain(base_opts)
-                + [(base_opts, '默认')])
+        return [(mobile, '移动端'), (base_opts, '默认')]
 
     if is_bili:
         return (_browser_cookie_chain(base_opts)
@@ -311,6 +309,8 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
                 status.log(f"  [字幕] {label} 未返回字幕文件，继续尝试...")
         except Exception as e:
             s = str(e)
+            if '429' in s or 'Too Many Requests' in s:
+                break  # 限流，静默退出，交给 Whisper
             is_browser = 'Cookie' in label
             is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
             if is_browser or is_retryable:
