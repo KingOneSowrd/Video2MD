@@ -573,22 +573,29 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         'outtmpl': str(sub_dir / '%(title)s'),
     })
 
-    # B站诊断：先 extract_info 列出可用字幕语言，方便排查
-    if _BILI_RE.search(url) and status:
+    # B站诊断：先 extract_info 列出可用字幕语言（print 到 stdout，不受 UI 30 行限制）
+    if _BILI_RE.search(url):
         try:
             diag_opts = {**opts, 'writesubtitles': False, 'writeautomaticsub': False,
                          'logger': _SilentLogger()}
             bili_ck = get_bili_cookies_file()
+            cookie_note = f'cookie={bili_ck.name}' if bili_ck else 'cookie=无'
             if bili_ck:
                 diag_opts['cookiefile'] = str(bili_ck)
             with yt_dlp.YoutubeDL(diag_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             subs = list((info or {}).get('subtitles', {}).keys())
             auto = list((info or {}).get('automatic_captions', {}).keys())
-            status.log(f"  [字幕] 可用字幕: {subs}  自动字幕: {auto}"
-                       + ('' if (subs or auto) else '  ← 均为空，Cookie 可能无效或视频无字幕'))
-        except Exception:
-            pass
+            msg = (f"[字幕诊断] {cookie_note} | 字幕: {subs} | 自动字幕: {auto}"
+                   + ('' if (subs or auto) else ' ← 均为空'))
+            print(msg, flush=True)
+            if status:
+                status.log(f"  {msg}")
+        except Exception as e:
+            msg = f"[字幕诊断] 失败: {e}"
+            print(msg, flush=True)
+            if status:
+                status.log(f"  {msg}")
 
     for attempt_opts, label in _subtitle_fallback_chain(opts, url):
         try:
