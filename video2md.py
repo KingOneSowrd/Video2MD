@@ -25,6 +25,7 @@ import yt_dlp
 STATUS_FILE = Path.home() / '.video2md_status.json'
 
 _BILI_RE = re.compile(r'bilibili\.com|b23\.tv', re.I)
+_YT_RE   = re.compile(r'youtube\.com|youtu\.be', re.I)
 
 
 def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
@@ -38,6 +39,14 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
             opts['cookiefile'] = next(it)
         elif k == '--referer':
             opts.setdefault('http_headers', {})['Referer'] = next(it)
+    return opts
+
+
+def _apply_yt_client(opts: dict, url: str) -> dict:
+    """YouTube URL 自动注入 tv_embedded 客户端，绕过 bot 检测，无需登录。"""
+    if _YT_RE.search(url):
+        opts.setdefault('extractor_args', {}) \
+            .setdefault('youtube', {})['player_client'] = ['tv_embedded', 'web']
     return opts
 
 
@@ -160,6 +169,7 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
+    _apply_yt_client(opts, src)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(src, download=False)
@@ -184,6 +194,7 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
+    _apply_yt_client(opts, url)
     opts.update({
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -282,6 +293,7 @@ def download_video(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
+    _apply_yt_client(opts, url)
     opts.update({
         'format': (
             'bestvideo[height<=1080]+bestaudio/'
