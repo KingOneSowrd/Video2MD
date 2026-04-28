@@ -1079,8 +1079,25 @@ def check_ffmpeg() -> bool:
     return False
 
 
+def _whisper_local_dir(model_size: str = 'small') -> Path:
+    """返回 EXE/脚本同目录下的 Whisper 模型路径。"""
+    base = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
+            else Path(__file__).parent)
+    return base / 'models' / f'faster-whisper-{model_size}'
+
+
 def check_whisper_model(model_size: str = 'small') -> bool:
-    """Whisper 模型是否已在本机缓存。"""
+    """Whisper 模型是否已就绪（优先查 EXE 同目录，兼容旧版 HF 缓存）。"""
+    # 新位置：EXE/脚本同目录 models/
+    local = _whisper_local_dir(model_size)
+    if local.exists():
+        for p in local.glob('model.bin'):
+            try:
+                if p.stat().st_size > 100_000:
+                    return True
+            except Exception:
+                pass
+    # 旧位置兼容：~/.cache/huggingface
     import os
     hf_home = Path(os.environ.get('HF_HOME',
                    str(Path.home() / '.cache' / 'huggingface')))
@@ -1327,7 +1344,9 @@ class SetupWindow(QMainWindow):
 
             from huggingface_hub import hf_hub_download, list_repo_files
 
-            repo_id = 'Systran/faster-whisper-small'
+            repo_id  = 'Systran/faster-whisper-small'
+            save_dir = _whisper_local_dir('small')
+            save_dir.mkdir(parents=True, exist_ok=True)
             attempts = [
                 (mirror_url, 1),
                 (mirror_url, 2),
@@ -1346,7 +1365,7 @@ class SetupWindow(QMainWindow):
 
                     for i, fname in enumerate(files, 1):
                         self._w_current_file = f"文件 {i}/{total}: {fname}"
-                        hf_hub_download(repo_id, fname)
+                        hf_hub_download(repo_id, fname, local_dir=str(save_dir))
 
                     QTimer.singleShot(0, lambda: self._on_whisper_done(True))
                     return
@@ -1362,17 +1381,14 @@ class SetupWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _poll_whisper_size(self):
-        import os
-        hf_home = Path(os.environ.get('HF_HOME',
-                       str(Path.home() / '.cache' / 'huggingface')))
-        blobs_dir = hf_home / 'hub' / 'models--Systran--faster-whisper-small' / 'blobs'
+        model_dir = _whisper_local_dir('small')
         file_info = getattr(self, '_w_current_file', '')
-        if not blobs_dir.exists():
+        if not model_dir.exists():
             if file_info:
                 self._w_log.setText(file_info)
             return
         try:
-            total = sum(f.stat().st_size for f in blobs_dir.iterdir() if f.is_file())
+            total = sum(f.stat().st_size for f in model_dir.rglob('*') if f.is_file())
             mb = total / 1_048_576
             if file_info:
                 self._w_log.setText(f"{file_info}  ({mb:.0f} MB 已缓存)")

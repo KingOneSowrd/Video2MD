@@ -341,7 +341,10 @@ def transcribe(audio_path: Path, model_size: str, lang: str | None,
         status.update("transcribing", f"[转录] faster-whisper ({model_size})...", 0.10)
         status.log(f"[转录] faster-whisper ({model_size})...")
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_size, device='cpu', compute_type='int8')
+    local = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
+             else Path(__file__).parent) / 'models' / f'faster-whisper-{model_size}'
+    model_path = str(local) if (local / 'model.bin').exists() else model_size
+    model = WhisperModel(model_path, device='cpu', compute_type='int8')
     kwargs = {'beam_size': 5, 'vad_filter': True}
     if lang:
         kwargs['language'] = lang
