@@ -86,6 +86,30 @@ def _browser_cookie_chain(base_opts: dict) -> list[tuple[dict, str]]:
             for b in browsers]
 
 
+def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
+    """
+    字幕提取专用重试链（与下载链顺序不同）：
+    - YouTube：移动端优先（直接绕过 bot 检测），再试浏览器 Cookie，最后 web
+    - B站：浏览器 Cookie 优先（AI 字幕需要登录态），再试默认
+    - 其他：仅默认
+    """
+    is_yt   = bool(_YT_RE.search(url))
+    is_bili = bool(_BILI_RE.search(url))
+
+    if is_yt:
+        mobile = {**base_opts,
+                  'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}}
+        return ([(mobile, '移动端')]
+                + _browser_cookie_chain(base_opts)
+                + [(base_opts, '默认')])
+
+    if is_bili:
+        return (_browser_cookie_chain(base_opts)
+                + [(base_opts, '默认')])
+
+    return [(base_opts, '默认')]
+
+
 def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
     """
     YouTube / B站 认证失败时的自动重试链：
@@ -275,7 +299,7 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         'outtmpl': str(sub_dir / '%(title)s'),
     })
 
-    for attempt_opts, label in _platform_fallback_chain(opts, url):
+    for attempt_opts, label in _subtitle_fallback_chain(opts, url):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 ydl.download([url])
