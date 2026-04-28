@@ -42,11 +42,45 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
     return opts
 
 
-_YT_BOT_RE = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
+_YT_BOT_RE    = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
+_COOKIE_ERR_RE = re.compile(r'cookie|keyring|could not copy|permission denied', re.I)
 
-def _yt_bot_fallback_opts() -> dict:
-    """bot 检测触发时的备用客户端 opts（画质可能降级但不被拦截）。"""
-    return {'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'tv_embedded']}}}
+
+def _yt_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
+    """
+    YouTube bot 检测触发时的重试链：
+    优先使用未启动的浏览器（DB 未锁），最后用移动端客户端（低画质）兜底。
+    """
+    if not _YT_RE.search(url):
+        return [(base_opts, '默认')]
+
+    # 检测正在运行的浏览器（Windows: 用 tasklist；其他平台跳过检测）
+    running: set[str] = set()
+    if sys.platform == 'win32':
+        try:
+            out = subprocess.run(
+                ['tasklist', '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, timeout=5
+            ).stdout.lower()
+            for b, exe in [('chrome', 'chrome.exe'),
+                           ('edge',   'msedge.exe'),
+                           ('firefox','firefox.exe')]:
+                if exe in out:
+                    running.add(b)
+        except Exception:
+            pass
+
+    # 未运行的浏览器排前面，降低 DB 锁概率
+    browsers = sorted(['chrome', 'edge', 'firefox'], key=lambda b: b in running)
+
+    chain: list[tuple[dict, str]] = [(base_opts, '默认')]
+    for b in browsers:
+        chain.append(({**base_opts, 'cookiesfrombrowser': (b, None, None, None)}, f'{b} Cookie'))
+    # 最后兜底：移动端客户端（不需要 Cookie，但画质可能降级）
+    chain.append(({**base_opts,
+                   'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'tv_embedded']}}},
+                  '备用客户端'))
+    return chain
 
 
 def _ffmpeg_bin(name: str) -> str:
@@ -168,14 +202,16 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
-    for attempt_opts in [opts, {**opts, **_yt_bot_fallback_opts()}]:
+    for attempt_opts, _ in _yt_fallback_chain(opts, src):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 info = ydl.extract_info(src, download=False)
                 return info.get('title', 'video'), float(info.get('duration', 0))
         except Exception as e:
-            if not (_YT_RE.search(src) and _YT_BOT_RE.search(str(e))):
-                break  # 非 bot 检测错误，不重试
+            s = str(e)
+            if _YT_BOT_RE.search(s) or _COOKIE_ERR_RE.search(s):
+                continue  # 尝试下一个
+            break
     return 'video', 0.0
 
 
@@ -203,17 +239,20 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         'outtmpl': str(sub_dir / '%(title)s'),
     })
 
-    for attempt_opts in [opts, {**opts, **_yt_bot_fallback_opts()}]:
+    for attempt_opts, label in _yt_fallback_chain(opts, url):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 ydl.download([url])
             break
         except Exception as e:
-            err = str(e)
-            if not (_YT_RE.search(url) and _YT_BOT_RE.search(err)):
-                if status:
-                    status.log(f"  [字幕] {err[:120]}")
-                break
+            s = str(e)
+            if _YT_BOT_RE.search(s) or _COOKIE_ERR_RE.search(s):
+                if label != '默认' and status:
+                    status.log(f"  [字幕] {label} 失败，继续尝试...")
+                continue
+            if status:
+                status.log(f"  [字幕] {s[:120]}")
+            break
 
     vtt_files = list(sub_dir.glob('*.vtt')) + list(sub_dir.glob('*.srt'))
     if not vtt_files:
@@ -316,7 +355,7 @@ def download_video(url: str, work_dir: Path, status=None,
     })
 
     last_err = None
-    for attempt_opts in [opts, {**opts, **_yt_bot_fallback_opts()}]:
+    for attempt_opts, label in _yt_fallback_chain(opts, url):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 ydl.download([url])
@@ -324,11 +363,12 @@ def download_video(url: str, work_dir: Path, status=None,
             break
         except yt_dlp.utils.DownloadError as e:
             last_err = e
-            err = str(e)
-            if not (_YT_RE.search(url) and _YT_BOT_RE.search(err)):
-                break  # 非 bot 检测，不重试
-            if status:
-                status.log("  [下载] bot 检测，切换备用客户端重试...")
+            s = str(e)
+            if _YT_BOT_RE.search(s) or _COOKIE_ERR_RE.search(s):
+                if label != '默认' and status:
+                    status.log(f"  [下载] {label} 失败，继续尝试...")
+                continue
+            break  # 非 bot/cookie 错误，不重试
 
     if last_err:
         err = str(last_err)
