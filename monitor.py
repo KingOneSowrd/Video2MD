@@ -1029,6 +1029,13 @@ class TaskRow(QWidget):
                 rm_btn.setFixedWidth(22)
                 rm_btn.clicked.connect(lambda checked=False, i=tid: on_remove(i))
                 r1.addWidget(rm_btn)
+        elif status == "processing":
+            tid = task.get("id")
+            if on_remove:
+                rm_btn = _retro_btn("×", C_ERROR)
+                rm_btn.setFixedWidth(22)
+                rm_btn.clicked.connect(lambda checked=False, i=tid: on_remove(i))
+                r1.addWidget(rm_btn)
 
         lay.addLayout(r1)
 
@@ -1714,7 +1721,21 @@ class MainWindow(QMainWindow):
         if not STATUS_FILE.exists():
             return
         try:
-            data  = json.loads(STATUS_FILE.read_text(encoding='utf-8'))
+            data = json.loads(STATUS_FILE.read_text(encoding='utf-8'))
+            task = next((t for t in data.get('tasks', []) if t.get('id') == task_id), None)
+
+            if task and task.get('status') == 'processing':
+                video2md.cancel_task(task_id)
+                asset_dir = task.get('pending_asset_dir')
+                output_md = task.get('pending_output_md')
+                if asset_dir:
+                    shutil.rmtree(asset_dir, ignore_errors=True)
+                if output_md:
+                    try:
+                        Path(output_md).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
             tasks = [t for t in data.get('tasks', []) if t.get('id') != task_id]
             STATUS_FILE.write_text(
                 json.dumps({'tasks': tasks}, ensure_ascii=False, indent=2),

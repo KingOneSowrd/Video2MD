@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,9 @@ STATUS_FILE = Path.home() / '.video2md_status.json'
 
 _BILI_RE = re.compile(r'bilibili\.com|b23\.tv', re.I)
 _YT_RE   = re.compile(r'youtube\.com|youtu\.be', re.I)
+
+_cancel_events: dict  = {}   # task_id -> threading.Event
+_status_writers: dict = {}   # task_id -> StatusWriter
 
 
 def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
@@ -232,6 +236,18 @@ def get_bili_cookies_file() -> 'Path | None':
     return None
 
 
+def cancel_task(task_id: str) -> bool:
+    """取消正在处理的任务：标记 StatusWriter 不再写入，并设置 cancel 事件。"""
+    sw = _status_writers.get(task_id)
+    if sw:
+        sw.cancelled = True
+    ev = _cancel_events.get(task_id)
+    if ev:
+        ev.set()
+        return True
+    return False
+
+
 # ─────────────────────────── 状态写入 ────────────────────────────
 
 class StatusWriter:
@@ -239,6 +255,7 @@ class StatusWriter:
 
     def __init__(self, task_id: str, title: str, source: str):
         self.task_id = task_id
+        self.cancelled = False
         self._data = {
             "id": task_id,
             "title": title,
@@ -285,6 +302,8 @@ class StatusWriter:
         self._flush()
 
     def _flush(self):
+        if self.cancelled:
+            return
         try:
             tasks = []
             if STATUS_FILE.exists():
@@ -742,6 +761,14 @@ def process_video(src: str, out_dir: Path, model: str = 'small',
     asset_dir_name = asset_dir.name
 
     sw = StatusWriter(str(uuid.uuid4())[:8], title, src)
+    # 注册取消机制，并将输出路径写入状态供取消时清理
+    cancel_ev = threading.Event()
+    _cancel_events[sw.task_id] = cancel_ev
+    _status_writers[sw.task_id] = sw
+    sw._data['pending_output_md']  = str(out_md)
+    sw._data['pending_asset_dir']  = str(asset_dir)
+    sw._flush()
+
     sw.log(f"标题：{title}")
     sw.log(f"时长：{fmt_time(duration) if duration else '未知'}")
 
@@ -756,12 +783,18 @@ def process_video(src: str, out_dir: Path, model: str = 'small',
                 sw.log("[字幕] 尝试平台字幕...")
                 segments = try_platform_subtitles(src, work, status=sw, extra_args=extra_ydl)
 
+            if cancel_ev.is_set():
+                raise RuntimeError('cancelled')
+
             needs_download = not is_local and (segments is None or True)
             # 帧提取始终需要视频文件（在线视频必须下载）
             if not is_local:
                 sw.update("downloading", "[下载] 下载视频...", 0.04)
                 sw.log("[下载] 下载视频（最高 1080p）...")
                 video_path = download_video(src, work, status=sw, extra_args=extra_ydl)
+
+            if cancel_ev.is_set():
+                raise RuntimeError('cancelled')
 
             # 字幕缓存：统一存到 EXE 同目录 cache/，处理完自动删除
             cache_key = Path(src).stem if is_local else safe_name(title)
@@ -785,6 +818,9 @@ def process_video(src: str, out_dir: Path, model: str = 'small',
                 print(cache_msg, flush=True)
                 sw.log(cache_msg)
 
+            if cancel_ev.is_set():
+                raise RuntimeError('cancelled')
+
             sw.update("extracting_frames", "[截图] 场景检测关键帧...", 0.76)
             sw.log(f"[截图] 场景检测关键帧（阈值={threshold}）...")
             asset_dir.mkdir(parents=True, exist_ok=True)
@@ -805,8 +841,12 @@ def process_video(src: str, out_dir: Path, model: str = 'small',
                 pass
 
     except Exception as exc:
-        sw.error(str(exc))
+        if not cancel_ev.is_set():
+            sw.error(str(exc))
         raise
+    finally:
+        _cancel_events.pop(sw.task_id, None)
+        _status_writers.pop(sw.task_id, None)
 
     sw.complete(len(frames), len(segments) if segments else 0, str(out_md))
 
