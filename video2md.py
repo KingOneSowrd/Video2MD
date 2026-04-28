@@ -99,7 +99,7 @@ def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
     if is_yt:
         mobile = {**base_opts,
                   'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}}
-        return [(mobile, '移动端'), (base_opts, '默认')]
+        return [(base_opts, '默认'), (mobile, '移动端')]
 
     if is_bili:
         chain = []
@@ -420,7 +420,8 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         except Exception as e:
             s = str(e)
             if '429' in s or 'Too Many Requests' in s:
-                break  # 限流，静默退出，交给 Whisper
+                # 限流：继续尝试下一个客户端；全部429则静默退出交给Whisper
+                continue
             is_browser = 'Cookie' in label
             is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
             if is_browser or is_retryable:
