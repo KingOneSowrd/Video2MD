@@ -43,10 +43,10 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
 
 
 def _apply_yt_client(opts: dict, url: str) -> dict:
-    """YouTube URL 自动注入 tv_embedded 客户端，绕过 bot 检测，无需登录。"""
+    """YouTube URL 注入客户端列表：ios 提供完整 DASH 格式且绕过 bot 检测，tv_embedded 兜底。"""
     if _YT_RE.search(url):
         opts.setdefault('extractor_args', {}) \
-            .setdefault('youtube', {})['player_client'] = ['tv_embedded', 'web']
+            .setdefault('youtube', {})['player_client'] = ['ios', 'android', 'tv_embedded']
     return opts
 
 
