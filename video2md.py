@@ -203,8 +203,8 @@ def _extract_edge_cookies_to_file(domain: str = 'bilibili.com') -> Path | None:
         if not cookie_db.exists():
             return None
 
-        # 直接打开（Edge 未运行时文件不被锁）
-        with _sq.connect(str(cookie_db)) as conn:
+        # timeout=0.3：Edge 运行时文件被锁，0.3s 内拿不到则直接放弃，不阻塞
+        with _sq.connect(str(cookie_db), timeout=0.3) as conn:
             rows = conn.execute(
                 'SELECT host_key, name, path, encrypted_value, expires_utc, is_secure '
                 'FROM cookies WHERE host_key LIKE ?',
@@ -245,14 +245,15 @@ def refresh_bili_cookies() -> Path | None:
 
 
 def get_bili_cookies_file() -> Path | None:
-    """返回可用的 B站 cookies.txt（优先用缓存，缓存超 12h 则重新提取）。"""
+    """
+    返回可用的 B站 cookies.txt。
+    仅读取已有缓存（不触发 SQLite 提取，避免阻塞处理流程）。
+    提取操作只通过 refresh_bili_cookies() 由 UI 按钮主动触发。
+    """
     cached = _cache_dir() / 'cookies_bilibili_com.txt'
-    import time
-    if cached.exists():
-        age_h = (time.time() - cached.stat().st_mtime) / 3600
-        if age_h < 12:
-            return cached
-    return _extract_edge_cookies_to_file('bilibili.com')
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+    return None
 
 
 # ─────────────────────────── 状态写入 ────────────────────────────

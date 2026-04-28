@@ -1442,7 +1442,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_tray()
-        QTimer.singleShot(500, self._update_bili_cookie_status)
+        QTimer.singleShot(200, lambda: threading.Thread(
+            target=self._update_bili_cookie_status, daemon=True).start())
 
         self._clear_status_file()
         t = QTimer(self); t.timeout.connect(self._poll); t.start(600)
@@ -1551,18 +1552,20 @@ class MainWindow(QMainWindow):
 
     # ── B站 Cookie ───────────────────────────────────────
     def _update_bili_cookie_status(self):
-        """启动时和刷新后更新 Cookie 状态标签。"""
+        """更新 Cookie 状态标签（可在后台线程调用，UI 更新切回主线程）。"""
+        import time
         cached = video2md.get_bili_cookies_file()
         if cached and cached.exists():
-            import time
             age_h = (time.time() - cached.stat().st_mtime) / 3600
-            self._bili_cookie_lbl.setText(f"✓ 已缓存（{age_h:.0f}h前）")
-            self._bili_cookie_lbl.setStyleSheet(f"color:{_css(C_SUCCESS)}; background:transparent;")
-            self._bili_cookie_lbl.setGraphicsEffect(_glow(C_SUCCESS, 6))
+            msg, color = f"✓ 已缓存（{age_h:.0f}h前）", C_SUCCESS
         else:
-            self._bili_cookie_lbl.setText("未就绪，请关闭 Edge 后点击刷新")
-            self._bili_cookie_lbl.setStyleSheet(f"color:{_css(C_DIM)}; background:transparent;")
-            self._bili_cookie_lbl.setGraphicsEffect(_glow(C_DIM, 4))
+            msg, color = "未就绪，请关闭 Edge 后点击刷新", C_DIM
+
+        def _apply(m=msg, c=color):
+            self._bili_cookie_lbl.setText(m)
+            self._bili_cookie_lbl.setStyleSheet(f"color:{_css(c)}; background:transparent;")
+            self._bili_cookie_lbl.setGraphicsEffect(_glow(c, 6 if c == C_SUCCESS else 4))
+        QTimer.singleShot(0, _apply)
 
     def _refresh_bili_cookie(self):
         self._bili_cookie_btn.setEnabled(False)
