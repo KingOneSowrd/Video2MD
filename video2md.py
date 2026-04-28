@@ -102,8 +102,13 @@ def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
         return [(mobile, '移动端'), (base_opts, '默认')]
 
     if is_bili:
-        return (_browser_cookie_chain(base_opts)
-                + [(base_opts, '默认')])
+        chain = []
+        bili_cookies = get_bili_cookies_file()
+        if bili_cookies:
+            chain.append(({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
+        chain += _browser_cookie_chain(base_opts)
+        chain.append((base_opts, '默认'))
+        return chain
 
     return [(base_opts, '默认')]
 
@@ -121,6 +126,11 @@ def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
 
     if not (is_yt or is_bili):
         return chain
+
+    if is_bili:
+        bili_cookies = get_bili_cookies_file()
+        if bili_cookies:
+            chain.insert(0, ({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
 
     chain += _browser_cookie_chain(base_opts)
 
@@ -154,6 +164,72 @@ def _ffmpeg_bin(name: str) -> str:
         if p2.exists():
             return str(p2)
     return name
+
+
+# ─────────────────────────── 浏览器 Cookie 自动提取 ──────────────
+
+def _extract_edge_cookies_to_file(domain: str = 'bilibili.com') -> 'Path | None':
+    """直接读 Edge Cookie DB，解密后写成 Netscape cookies.txt。Edge 运行时文件被锁会直接返回 None。"""
+    if sys.platform != 'win32':
+        return None
+    try:
+        import json as _json, base64 as _b64, sqlite3 as _sq
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        import win32crypt
+    except ImportError:
+        return None
+    try:
+        edge_base   = Path.home() / 'AppData/Local/Microsoft/Edge/User Data/Default'
+        local_state = edge_base.parent / 'Local State'
+        if not local_state.exists():
+            return None
+        ls  = _json.loads(local_state.read_text('utf-8'))
+        enc_key = _b64.b64decode(ls['os_crypt']['encrypted_key'])[5:]
+        key = win32crypt.CryptUnprotectData(enc_key, None, None, None, 0)[1]
+        cookie_db = edge_base / 'Network' / 'Cookies'
+        if not cookie_db.exists():
+            cookie_db = edge_base / 'Cookies'
+        if not cookie_db.exists():
+            return None
+        with _sq.connect(str(cookie_db), timeout=0.3) as conn:
+            rows = conn.execute(
+                'SELECT host_key, name, path, encrypted_value, expires_utc, is_secure '
+                'FROM cookies WHERE host_key LIKE ?', (f'%{domain}%',)
+            ).fetchall()
+        if not rows:
+            return None
+        out_path = _cache_dir() / f'cookies_{domain.replace(".", "_")}.txt'
+        lines = ['# Netscape HTTP Cookie File\n']
+        ok = 0
+        for host, name, path_, enc_val, expires, secure in rows:
+            try:
+                val = AESGCM(key).decrypt(enc_val[3:15], enc_val[15:], b'').decode('utf-8')
+                exp = str(int(expires / 1_000_000 - 11_644_473_600)) if expires else '0'
+                flag = 'TRUE' if host.startswith('.') else 'FALSE'
+                sec  = 'TRUE' if secure else 'FALSE'
+                lines.append(f'{host}\t{flag}\t{path_}\t{sec}\t{exp}\t{name}\t{val}\n')
+                ok += 1
+            except Exception:
+                pass
+        if ok == 0:
+            return None
+        out_path.write_text(''.join(lines), encoding='utf-8')
+        return out_path
+    except Exception:
+        return None
+
+
+def refresh_bili_cookies() -> 'Path | None':
+    """供外部调用：尝试刷新 B站 Cookie 缓存，返回 cookies.txt 路径。"""
+    return _extract_edge_cookies_to_file('bilibili.com')
+
+
+def get_bili_cookies_file() -> 'Path | None':
+    """返回可用的 B站 cookies.txt（仅读缓存，不触发提取）。"""
+    cached = _cache_dir() / 'cookies_bilibili_com.txt'
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+    return None
 
 
 # ─────────────────────────── 状态写入 ────────────────────────────
