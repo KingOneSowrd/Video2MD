@@ -42,6 +42,20 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
     return opts
 
 
+_BILI_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/131.0.0.0 Safari/537.36'
+)
+
+def _apply_bili_headers(opts: dict, url: str) -> None:
+    """B站请求注入真实浏览器头，防止 412。"""
+    if _BILI_RE.search(url):
+        h = opts.setdefault('http_headers', {})
+        h['Referer']    = 'https://www.bilibili.com'
+        h['Origin']     = 'https://www.bilibili.com'
+        h.setdefault('User-Agent', _BILI_UA)
+
 _YT_BOT_RE     = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
 _BILI_AUTH_RE  = re.compile(r'login|大会员|需要登录|请先登录|仅限|premium|vip', re.I)
 _COOKIE_ERR_RE = re.compile(r'cookie|keyring|could not copy|permission denied|dpapi|decrypt', re.I)
@@ -213,7 +227,7 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
         return Path(src).stem, duration
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
-        opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
+        _apply_bili_headers(opts, src)
     for attempt_opts, _ in _platform_fallback_chain(opts, src):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
@@ -241,7 +255,7 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
-        opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
+        _apply_bili_headers(opts, url)
     opts.update({
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -353,7 +367,7 @@ def download_video(url: str, work_dir: Path, status=None,
 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
-        opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
+        _apply_bili_headers(opts, url)
     opts.update({
         'format': (
             'bestvideo[height<=1080]+bestaudio/'
