@@ -302,6 +302,14 @@ class StatusWriter:
 
 # ─────────────────────────── 工具函数 ────────────────────────────
 
+class _SilentLogger:
+    """yt-dlp 日志全部静默，用于浏览器 Cookie 尝试避免 DPAPI/DB锁 噪音。"""
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
 def fmt_time(seconds: float) -> str:
     td = timedelta(seconds=int(seconds))
     h = int(td.total_seconds()) // 3600
@@ -336,7 +344,8 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
         _apply_bili_headers(opts, src)
     for attempt_opts, label in _platform_fallback_chain(opts, src):
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 info = ydl.extract_info(src, download=False)
                 return info.get('title', 'video'), float(info.get('duration', 0))
         except Exception as e:
@@ -375,7 +384,8 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
 
     for attempt_opts, label in _subtitle_fallback_chain(opts, url):
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 ydl.download([url])
             # 无异常，但要确认文件真的生成了
             if list(sub_dir.glob('*.vtt')) or list(sub_dir.glob('*.srt')):
@@ -500,7 +510,8 @@ def download_video(url: str, work_dir: Path, status=None,
     last_err = None
     for attempt_opts, label in _platform_fallback_chain(opts, url):
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 ydl.download([url])
             last_err = None
             break
