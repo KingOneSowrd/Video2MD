@@ -1086,14 +1086,14 @@ def check_ffmpeg() -> bool:
     return False
 
 
-def _whisper_local_dir(model_size: str = 'small') -> Path:
+def _whisper_local_dir(model_size: str = 'medium') -> Path:
     """返回 EXE/脚本同目录下的 Whisper 模型路径。"""
     base = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
             else Path(__file__).parent)
     return base / 'models' / f'faster-whisper-{model_size}'
 
 
-def check_whisper_model(model_size: str = 'small') -> bool:
+def check_whisper_model(model_size: str = 'medium') -> bool:
     """Whisper 模型是否已就绪（优先查 EXE 同目录，兼容旧版 HF 缓存）。"""
     # 新位置：EXE/脚本同目录 models/
     local = _whisper_local_dir(model_size)
@@ -1222,7 +1222,7 @@ class SetupWindow(QMainWindow):
         row.addWidget(self._w_icon)
 
         col = QVBoxLayout(); col.setSpacing(3)
-        col.addWidget(glabel("Whisper small  ·  语音转录（~250MB）", 9,
+        col.addWidget(glabel("Whisper medium  ·  语音转录（~1.5GB）", 9,
                               bold=True, color=C_BRIGHT, glow_r=8))
         msg = "已缓存" if self._whisper_ok else "未找到，点右侧按钮下载"
         self._w_status = glabel(msg, 8, color=c, glow_r=5)
@@ -1351,8 +1351,8 @@ class SetupWindow(QMainWindow):
 
             from huggingface_hub import hf_hub_download, list_repo_files
 
-            repo_id  = 'Systran/faster-whisper-small'
-            save_dir = _whisper_local_dir('small')
+            repo_id  = 'Systran/faster-whisper-medium'
+            save_dir = _whisper_local_dir('medium')
             save_dir.mkdir(parents=True, exist_ok=True)
             attempts = [
                 (mirror_url, 1),
@@ -1388,7 +1388,7 @@ class SetupWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _poll_whisper_size(self):
-        model_dir = _whisper_local_dir('small')
+        model_dir = _whisper_local_dir('medium')
         file_info = getattr(self, '_w_current_file', '')
         if not model_dir.exists():
             if file_info:

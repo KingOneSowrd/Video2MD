@@ -741,7 +741,7 @@ def build_markdown(title: str, source: str,
 
 # ─────────────────────────── 主处理函数 ──────────────────────────
 
-def process_video(src: str, out_dir: Path, model: str = 'small',
+def process_video(src: str, out_dir: Path, model: str = 'medium',
                   lang: str | None = None, threshold: float = 0.5,
                   extra_ydl: list[str] | None = None):
     """
@@ -868,8 +868,8 @@ def main():
     ap.add_argument('-o', '--output', default=None, help='输出 .md 路径')
     ap.add_argument('--outdir', default=None,
                     help='输出目录（用视频标题自动命名 .md 文件，与 -o 互斥）')
-    ap.add_argument('--model', default='small',
-                    choices=['tiny', 'base', 'small', 'medium'],
+    ap.add_argument('--model', default='medium',
+                    choices=['tiny', 'base', 'small', 'medium', 'large-v3'],
                     help='Whisper 模型大小（默认 small）')
     ap.add_argument('--lang', default=None, help='语言提示，如 zh / en')
     ap.add_argument('--threshold', default=0.5, type=float,
