@@ -43,8 +43,8 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
 
 
 _YT_BOT_RE     = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
-_BILI_AUTH_RE  = re.compile(r'login|大会员|需要登录|请先登录|仅限|premium|vip|412', re.I)
-_COOKIE_ERR_RE = re.compile(r'cookie|keyring|could not copy|permission denied', re.I)
+_BILI_AUTH_RE  = re.compile(r'login|大会员|需要登录|请先登录|仅限|premium|vip', re.I)
+_COOKIE_ERR_RE = re.compile(r'cookie|keyring|could not copy|permission denied|dpapi|decrypt', re.I)
 
 
 def _running_browsers() -> set[str]:
