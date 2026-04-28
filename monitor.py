@@ -1314,8 +1314,17 @@ class SetupWindow(QMainWindow):
         self._w_poll_timer.start(1000)
 
         def run():
+            import io
             import os
+            import sys
             import time
+            # windowed EXE 下 stdout/stderr 为 None，huggingface_hub 的 tqdm 会崩
+            if sys.stdout is None:
+                sys.stdout = io.StringIO()
+            if sys.stderr is None:
+                sys.stderr = io.StringIO()
+            os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
+
             from huggingface_hub import hf_hub_download, list_repo_files
 
             repo_id = 'Systran/faster-whisper-small'
