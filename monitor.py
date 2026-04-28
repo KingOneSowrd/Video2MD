@@ -1472,8 +1472,8 @@ class MainWindow(QMainWindow):
         self._output_panel = OutputPanel(RAW_SOURCES)
         root.addWidget(self._output_panel)
 
-        self._cookies_panel = CookiesPanel()
-        root.addWidget(self._cookies_panel)
+        # self._cookies_panel = CookiesPanel()
+        # root.addWidget(self._cookies_panel)
         root.addWidget(_divider())
 
         mid = QHBoxLayout(); mid.setSpacing(8)
@@ -1626,7 +1626,7 @@ class MainWindow(QMainWindow):
         out_dir = self._output_panel.current_path()
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        extra_ydl: list[str] = self._cookies_panel.cookies_args()
+        extra_ydl: list[str] = []  # self._cookies_panel.cookies_args()
 
         self._log.append(
             f'<span style="color:{_css(C_PRIMARY)};">'
