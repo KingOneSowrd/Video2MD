@@ -1,5 +1,6 @@
 whisper_models/
 models/
+cache/
 __pycache__/
 build/
 dist/

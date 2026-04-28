@@ -109,6 +109,14 @@ def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
     return chain
 
 
+def _cache_dir() -> Path:
+    """返回 EXE/脚本同目录下的 cache/ 目录（自动创建）。"""
+    base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    d = base / 'cache'
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def _ffmpeg_bin(name: str) -> str:
     """
     查找 ffmpeg/ffprobe 路径，优先级：
@@ -639,11 +647,9 @@ def process_video(src: str, out_dir: Path, model: str = 'small',
                 sw.log("[下载] 下载视频（最高 1080p）...")
                 video_path = download_video(src, work, status=sw, extra_args=extra_ydl)
 
-            # 字幕缓存
-            if is_local:
-                seg_cache = Path(src).parent / f"{Path(src).stem}_segments.json"
-            else:
-                seg_cache = out_md.parent / f"{out_md.stem}_segments.json"
+            # 字幕缓存：统一存到 EXE 同目录 cache/，处理完自动删除
+            cache_key = Path(src).stem if is_local else safe_name(title)
+            seg_cache = _cache_dir() / f"{cache_key}_segments.json"
 
             if segments is None and seg_cache.exists():
                 sw.update("cached_segments", "[字幕] 加载缓存...", 0.08)
@@ -675,6 +681,12 @@ def process_video(src: str, out_dir: Path, model: str = 'small',
             md = build_markdown(title, src, segments or [], frames, asset_dir_name)
             out_md.parent.mkdir(parents=True, exist_ok=True)
             out_md.write_text(md, encoding='utf-8')
+
+            # 处理成功后删除字幕缓存（失败时保留，供下次断点续用）
+            try:
+                seg_cache.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     except Exception as exc:
         sw.error(str(exc))
