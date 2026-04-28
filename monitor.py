@@ -850,7 +850,7 @@ class CookiesPanel(Panel):
     """Optional cookies.txt file picker (avoids browser DB lock)."""
 
     def __init__(self, parent=None):
-        super().__init__("Cookie 文件（仅Bilibili需要）", parent)
+        super().__init__("Cookie 文件（B站 / YouTube 等需要）", parent)
         self.setAcceptDrops(True)
         self.setFixedHeight(52)
 
@@ -1610,9 +1610,7 @@ class MainWindow(QMainWindow):
         out_dir = self._output_panel.current_path()
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        extra_ydl: list[str] = []
-        if re.search(r'bilibili\.com|b23\.tv', src, re.I):
-            extra_ydl += self._cookies_panel.cookies_args()
+        extra_ydl: list[str] = self._cookies_panel.cookies_args()
 
         self._log.append(
             f'<span style="color:{_css(C_PRIMARY)};">'
