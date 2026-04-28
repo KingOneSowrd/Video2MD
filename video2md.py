@@ -567,11 +567,28 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
     opts.update({
         'writesubtitles': True,
         'writeautomaticsub': True,
-        'subtitleslangs': ['zh-Hans', 'zh', 'zh-CN', 'ai-zh', 'en'],
+        'subtitleslangs': ['all', '-live_chat'],  # 不过滤语言码，防止 ai-zh 等被漏掉
         'subtitlesformat': 'vtt/srt/best',
         'skip_download': True,
         'outtmpl': str(sub_dir / '%(title)s'),
     })
+
+    # B站诊断：先 extract_info 列出可用字幕语言，方便排查
+    if _BILI_RE.search(url) and status:
+        try:
+            diag_opts = {**opts, 'writesubtitles': False, 'writeautomaticsub': False,
+                         'logger': _SilentLogger()}
+            bili_ck = get_bili_cookies_file()
+            if bili_ck:
+                diag_opts['cookiefile'] = str(bili_ck)
+            with yt_dlp.YoutubeDL(diag_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            subs = list((info or {}).get('subtitles', {}).keys())
+            auto = list((info or {}).get('automatic_captions', {}).keys())
+            status.log(f"  [字幕] 可用字幕: {subs}  自动字幕: {auto}"
+                       + ('' if (subs or auto) else '  ← 均为空，Cookie 可能无效或视频无字幕'))
+        except Exception:
+            pass
 
     for attempt_opts, label in _subtitle_fallback_chain(opts, url):
         try:
@@ -579,8 +596,8 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
             with yt_dlp.YoutubeDL(run_opts) as ydl:
                 ydl.download([url])
             # 无异常，但要确认文件真的生成了
-            if list(sub_dir.glob('*.vtt')) or list(sub_dir.glob('*.srt')):
-                break  # 拿到字幕，停止重试
+            if list(sub_dir.glob('*')):
+                break  # 拿到任何字幕文件，停止重试
             # 无文件（可能需要 Cookie 才能访问字幕 API），继续尝试
             if status:
                 status.log(f"  [字幕] {label} 未返回字幕文件，继续尝试...")
@@ -598,15 +615,19 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
                 status.log(f"  [字幕] {s[:120]}")
             break
 
-    vtt_files = list(sub_dir.glob('*.vtt')) + list(sub_dir.glob('*.srt'))
-    if not vtt_files:
+    all_sub_files = [f for f in sub_dir.glob('*') if f.suffix in ('.vtt', '.srt')]
+    if status:
+        all_downloaded = list(sub_dir.glob('*'))
+        if all_downloaded:
+            status.log(f"  [字幕] 已下载文件: {[f.name for f in all_downloaded]}")
+    if not all_sub_files:
         print("  → 无平台字幕，将使用 Whisper。", flush=True)
         return None
 
     # 优先取中文字幕
-    preferred = next((f for f in vtt_files if any(
-        tag in f.name for tag in ('zh', 'cn', 'CN', 'Hans')
-    )), vtt_files[0])
+    preferred = next((f for f in all_sub_files if any(
+        tag in f.name for tag in ('zh', 'cn', 'CN', 'Hans', 'ai')
+    )), all_sub_files[0])
     print(f"  → 找到字幕：{preferred.name}", flush=True)
     return _parse_vtt(preferred) if preferred.suffix == '.vtt' else _parse_srt(preferred)
 
