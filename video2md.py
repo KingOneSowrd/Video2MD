@@ -172,10 +172,170 @@ def _ffmpeg_bin(name: str) -> str:
 
 # ─────────────────────────── 浏览器 Cookie 自动提取 ──────────────
 
-def _extract_edge_cookies_to_file(domain: str = 'bilibili.com') -> 'Path | None':
-    """直接读 Edge Cookie DB，解密后写成 Netscape cookies.txt。Edge 运行时文件被锁会直接返回 None。"""
-    if sys.platform != 'win32':
+def _cdp_ws_send(sock, obj: dict):
+    """发送 WebSocket 文本帧（FIN=1, opcode=text, 带掩码，Client→Server）。"""
+    import struct as _st
+    data = json.dumps(obj).encode()
+    n    = len(data)
+    hdr  = bytearray([0x81])
+    if   n <= 125:   hdr.append(n | 0x80)
+    elif n <= 65535: hdr += bytes([126 | 0x80]) + _st.pack('>H', n)
+    else:            hdr += bytes([127 | 0x80]) + _st.pack('>Q', n)
+    mask = os.urandom(4)
+    hdr += mask
+    sock.sendall(bytes(hdr) + bytes(data[i] ^ mask[i % 4] for i in range(n)))
+
+
+def _cdp_ws_recv(sock) -> dict:
+    """接收 WebSocket 帧（Server→Client，无掩码），处理分片，返回 JSON dict。"""
+    import struct as _st
+
+    def read(n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("WebSocket closed")
+            buf += chunk
+        return buf
+
+    payload = b""
+    while True:
+        h      = read(2)
+        fin    = bool(h[0] & 0x80)
+        op     = h[0] & 0x0f
+        masked = bool(h[1] & 0x80)
+        length = h[1] & 0x7f
+        if length == 126: length = _st.unpack('>H', read(2))[0]
+        elif length == 127: length = _st.unpack('>Q', read(8))[0]
+        mk    = read(4) if masked else b""
+        frame = read(length)
+        if masked:
+            frame = bytes(frame[i] ^ mk[i % 4] for i in range(length))
+        if op in (0, 1, 2):  # continuation / text / binary
+            payload += frame
+        if fin:
+            break
+    try:
+        return json.loads(payload.decode())
+    except Exception:
+        return {}
+
+
+def _cdp_get_all_cookies(ws_url: str) -> list:
+    """通过 CDP WebSocket 调用 Network.getAllCookies，返回 cookie 列表。"""
+    import socket as _sock, base64 as _b64
+
+    url       = ws_url.removeprefix('ws://')
+    host_part, _, rest = url.partition('/')
+    host, _, port_s    = host_part.rpartition(':')
+    ws_path   = '/' + rest
+
+    s = _sock.socket()
+    s.settimeout(10)
+    try:
+        s.connect((host, int(port_s)))
+        key = _b64.b64encode(os.urandom(16)).decode()
+        s.sendall((
+            f"GET {ws_path} HTTP/1.1\r\nHost: {host_part}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                return []
+            buf += chunk
+        _cdp_ws_send(s, {"id": 1, "method": "Network.getAllCookies"})
+        for _ in range(50):
+            msg = _cdp_ws_recv(s)
+            if msg.get('id') == 1:
+                return msg.get('result', {}).get('cookies', [])
+        return []
+    except Exception:
+        return []
+    finally:
+        s.close()
+
+
+def _cdp_extract_cookies(domain: str) -> 'Path | None':
+    """启动 headless Edge 调试实例，通过 CDP 提取 Cookie（支持 Edge 127+ App-Bound Encryption）。"""
+    import socket as _sock, http.client as _http, time as _time
+
+    edge_exe = None
+    for pf_key in ('ProgramFiles(x86)', 'ProgramFiles'):
+        p = Path(os.environ.get(pf_key, '')) / 'Microsoft/Edge/Application/msedge.exe'
+        if p.exists():
+            edge_exe = str(p); break
+    if not edge_exe:
         return None
+
+    with _sock.socket() as tmp:
+        tmp.bind(('127.0.0.1', 0))
+        cdp_port = tmp.getsockname()[1]
+
+    user_data = str(Path.home() / 'AppData/Local/Microsoft/Edge/User Data')
+    proc = subprocess.Popen(
+        [edge_exe,
+         f'--remote-debugging-port={cdp_port}',
+         '--headless=new',
+         f'--user-data-dir={user_data}',
+         '--no-first-run', '--no-default-browser-check',
+         '--disable-extensions', '--disable-sync',
+         '--disable-gpu', '--log-level=3',
+         'about:blank'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        page_ws = None
+        for _ in range(40):  # 最多等 10 秒
+            try:
+                c = _http.HTTPConnection('127.0.0.1', cdp_port, timeout=1)
+                c.request('GET', '/json')
+                targets = json.loads(c.getresponse().read().decode())
+                for t in targets:
+                    if t.get('type') == 'page' and 'webSocketDebuggerUrl' in t:
+                        page_ws = t['webSocketDebuggerUrl']; break
+                if page_ws:
+                    break
+            except Exception:
+                pass
+            _time.sleep(0.25)
+        if not page_ws:
+            return None
+
+        all_cookies  = _cdp_get_all_cookies(page_ws)
+        bili_cookies = [c for c in all_cookies
+                        if domain.split('.')[0] in c.get('domain', '')]
+        if not bili_cookies:
+            return None
+
+        out_path = _cache_dir() / f'cookies_{domain.replace(".", "_")}.txt'
+        lines = ['# Netscape HTTP Cookie File\n']
+        for ck in bili_cookies:
+            d = ck['domain']
+            lines.append('\t'.join([
+                d,
+                'TRUE' if d.startswith('.') else 'FALSE',
+                ck.get('path', '/'),
+                'TRUE' if ck.get('secure', False) else 'FALSE',
+                str(int(ck.get('expires', -1))),
+                ck['name'],
+                ck.get('value', ''),
+            ]) + '\n')
+        out_path.write_text(''.join(lines), encoding='utf-8')
+        return out_path
+
+    finally:
+        try:
+            proc.terminate(); proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
+def _aesgcm_extract_cookies(domain: str) -> 'Path | None':
+    """旧式 DPAPI+AESGCM 方案（Edge < 127 备用）。"""
     try:
         import json as _json, base64 as _b64, sqlite3 as _sq
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -221,6 +381,18 @@ def _extract_edge_cookies_to_file(domain: str = 'bilibili.com') -> 'Path | None'
         return out_path
     except Exception:
         return None
+
+
+def _extract_edge_cookies_to_file(domain: str = 'bilibili.com') -> 'Path | None':
+    """
+    主入口：CDP 方案优先（支持 Edge 127+ App-Bound Encryption），
+    失败则退回旧式 AESGCM（Edge < 127）。Edge 运行时直接返回 None。
+    """
+    if sys.platform != 'win32':
+        return None
+    if 'edge' in _running_browsers():
+        return None
+    return _cdp_extract_cookies(domain) or _aesgcm_extract_cookies(domain)
 
 
 def refresh_bili_cookies() -> 'Path | None':
