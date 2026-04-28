@@ -228,15 +228,17 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         _apply_bili_headers(opts, src)
-    for attempt_opts, _ in _platform_fallback_chain(opts, src):
+    for attempt_opts, label in _platform_fallback_chain(opts, src):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 info = ydl.extract_info(src, download=False)
                 return info.get('title', 'video'), float(info.get('duration', 0))
         except Exception as e:
             s = str(e)
-            if _YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s):
-                continue  # 尝试下一个
+            is_browser = 'Cookie' in label
+            is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
+            if is_browser or is_retryable:
+                continue
             break
     return 'video', 0.0
 
@@ -272,7 +274,9 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
             break
         except Exception as e:
             s = str(e)
-            if _YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s):
+            is_browser = 'Cookie' in label
+            is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
+            if is_browser or is_retryable:
                 if label != '默认' and status:
                     status.log(f"  [字幕] {label} 失败，继续尝试...")
                 continue
@@ -390,7 +394,9 @@ def download_video(url: str, work_dir: Path, status=None,
         except yt_dlp.utils.DownloadError as e:
             last_err = e
             s = str(e)
-            if _YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s):
+            is_browser = 'Cookie' in label
+            is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
+            if is_browser or is_retryable:
                 if label != '默认' and status:
                     status.log(f"  [下载] {label} 失败，继续尝试...")
                 continue
