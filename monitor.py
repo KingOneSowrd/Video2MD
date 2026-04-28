@@ -1449,8 +1449,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_tray()
-        QTimer.singleShot(200, lambda: threading.Thread(
-            target=self._update_bili_cookie_status, daemon=True).start())
 
         self._clear_status_file()
         t = QTimer(self); t.timeout.connect(self._poll); t.start(600)
@@ -1481,16 +1479,8 @@ class MainWindow(QMainWindow):
         self._output_panel = OutputPanel(RAW_SOURCES)
         root.addWidget(self._output_panel)
 
-        # ── B站 Cookie 状态栏 ─────────────────────────────
-        bili_row = QHBoxLayout(); bili_row.setSpacing(8)
-        bili_row.addWidget(glabel("B站Cookie:", 8, color=C_DIM, glow_r=4))
-        self._bili_cookie_lbl = glabel("检测中...", 8, color=C_DIM, glow_r=4)
-        bili_row.addWidget(self._bili_cookie_lbl)
-        bili_row.addStretch()
-        self._bili_cookie_btn = _retro_btn("↺ 刷新（关闭Edge后）", C_DIM)
-        self._bili_cookie_btn.clicked.connect(self._refresh_bili_cookie)
-        bili_row.addWidget(self._bili_cookie_btn)
-        root.addLayout(bili_row)
+        self._cookies_panel = CookiesPanel()
+        root.addWidget(self._cookies_panel)
 
         root.addWidget(_divider())
 
@@ -1556,49 +1546,6 @@ class MainWindow(QMainWindow):
         self._dot = glabel("●", 9, color=C_DIM, glow_r=8)
         sb.addWidget(self._dot)
         root.addLayout(sb)
-
-    # ── B站 Cookie ───────────────────────────────────────
-    def _update_bili_cookie_status(self):
-        """更新 Cookie 状态标签（可在后台线程调用，UI 更新切回主线程）。"""
-        import time
-        cached = video2md.get_bili_cookies_file()
-        if cached and cached.exists():
-            age_h = (time.time() - cached.stat().st_mtime) / 3600
-            msg, color = f"✓ 已缓存（{age_h:.0f}h前）", C_SUCCESS
-        else:
-            msg, color = "未就绪，请关闭 Edge 后点击刷新", C_DIM
-
-        def _apply(m=msg, c=color):
-            self._bili_cookie_lbl.setText(m)
-            self._bili_cookie_lbl.setStyleSheet(f"color:{_css(c)}; background:transparent;")
-            self._bili_cookie_lbl.setGraphicsEffect(_glow(c, 6 if c == C_SUCCESS else 4))
-        QTimer.singleShot(0, _apply)
-
-    def _refresh_bili_cookie(self):
-        self._bili_cookie_btn.setEnabled(False)
-        self._bili_cookie_lbl.setText("提取中...")
-
-        def run():
-            result = video2md.refresh_bili_cookies()
-            QTimer.singleShot(0, lambda r=result: self._on_bili_cookie_done(r))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _on_bili_cookie_done(self, result):
-        self._bili_cookie_btn.setEnabled(True)
-        if result:
-            self._update_bili_cookie_status()
-            self._log.append(
-                f'<span style="color:{_css(C_SUCCESS)};">'
-                f'[{datetime.now().strftime("%H:%M:%S")}] B站 Cookie 已更新</span>'
-            )
-        else:
-            self._bili_cookie_lbl.setText("提取失败，请确认 Edge 已完全关闭")
-            self._bili_cookie_lbl.setStyleSheet(f"color:{_css(C_ERROR)}; background:transparent;")
-            self._log.append(
-                f'<span style="color:{_css(C_ERROR)};">'
-                f'[{datetime.now().strftime("%H:%M:%S")}] B站 Cookie 提取失败，请关闭 Edge 后重试</span>'
-            )
 
     # ── System tray ───────────────────────────────────────
     def _build_tray(self):
@@ -1687,7 +1634,7 @@ class MainWindow(QMainWindow):
         out_dir = self._output_panel.current_path()
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        extra_ydl: list[str] = []  # self._cookies_panel.cookies_args()
+        extra_ydl: list[str] = self._cookies_panel.cookies_args()
 
         self._log.append(
             f'<span style="color:{_css(C_PRIMARY)};">'
