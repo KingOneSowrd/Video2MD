@@ -366,42 +366,53 @@ def transcribe(audio_path: Path, model_size: str, lang: str | None,
 # ─────────────────────────── 关键帧提取 ──────────────────────────
 
 def extract_keyframes(video_path: Path, out_dir: Path,
-                      threshold: float = 0.5, max_frames: int = 80):
+                      threshold: float = 0.5, max_frames: int = 60):
     """
-    用 ffmpeg 场景检测提取关键帧，返回 [(timestamp_sec, Path), ...]。
-    showinfo 滤镜的 pts_time 写入 stderr，从中解析时间戳。
+    自适应场景检测：帧数不足时自动降低阈值重试，最终均匀采样到 max_frames。
     """
-    print(f"[截图] 场景检测关键帧（阈值={threshold}）...", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        _ffmpeg_bin('ffmpeg'), '-i', str(video_path),
-        '-vf', f'select=gt(scene\\,{threshold}),showinfo,scale=1920:-2',
-        '-vsync', 'vfr',
-        str(out_dir / 'frame_%05d.jpg'),
-        '-hide_banner'
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, encoding='utf-8', errors='replace', timeout=600)
+    def _detect(t: float) -> list:
+        # 清空上次结果
+        for f in out_dir.glob('frame_*.jpg'):
+            f.unlink(missing_ok=True)
+        print(f"[截图] 场景检测关键帧（阈值={t}）...", flush=True)
+        cmd = [
+            _ffmpeg_bin('ffmpeg'), '-i', str(video_path),
+            '-vf', f'select=gt(scene\\,{t}),showinfo,scale=1920:-2',
+            '-vsync', 'vfr',
+            str(out_dir / 'frame_%05d.jpg'),
+            '-hide_banner'
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding='utf-8', errors='replace', timeout=600)
+        timestamps = [
+            float(m.group(1))
+            for line in result.stdout.split('\n')
+            if (m := re.search(r'pts_time:(\d+\.?\d*)', line))
+        ]
+        files = sorted(out_dir.glob('frame_*.jpg'))
+        return [(timestamps[i] if i < len(timestamps) else 0.0, f)
+                for i, f in enumerate(files)]
 
-    timestamps = [
-        float(m.group(1))
-        for line in result.stdout.split('\n')
-        if (m := re.search(r'pts_time:(\d+\.?\d*)', line))
-    ]
+    frames = _detect(threshold)
 
-    frame_files = sorted(out_dir.glob('frame_*.jpg'))
+    # 帧数不足时依次降低阈值重试
+    if len(frames) < 15:
+        for lower in [0.3, 0.2, 0.12]:
+            frames = _detect(lower)
+            if len(frames) >= 15:
+                break
 
-    if not frame_files:
+    # 仍不足则改用间隔截图兜底
+    if not frames:
         print("  → 无场景变化，改用间隔截图（每30秒）。", flush=True)
         return _interval_frames(video_path, out_dir)
 
-    frames = [(timestamps[i] if i < len(timestamps) else 0.0, f)
-              for i, f in enumerate(frame_files)]
-
+    # 均匀采样到 max_frames（修正原 step=1 不削减的 bug）
     if len(frames) > max_frames:
-        step = len(frames) // max_frames
-        frames = frames[::step]
+        indices = [int(i * len(frames) / max_frames) for i in range(max_frames)]
+        frames = [frames[i] for i in indices]
 
     print(f"  → {len(frames)} 帧", flush=True)
     return frames
