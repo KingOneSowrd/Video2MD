@@ -1702,7 +1702,7 @@ class MainWindow(QMainWindow):
     def _worker(self, src: str, out_dir: Path, extra_ydl: list[str]):
         """在后台线程中调用 video2md.process_video()。"""
         try:
-            video2md.process_video(src, out_dir, lang='zh', extra_ydl=extra_ydl)
+            video2md.process_video(src, out_dir, extra_ydl=extra_ydl)
         except Exception:
             pass  # StatusWriter 已写入 error 状态，monitor 会自动显示
 
