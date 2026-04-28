@@ -289,6 +289,12 @@ def download_video(url: str, work_dir: Path, status=None,
             pct = d.get('downloaded_bytes', 0) / total
             status.update('downloading', f"[下载] {pct:.0%}", 0.04 + pct * 0.20)
             status.log(f"  [下载] {pct:.0%}")
+        elif d['status'] == 'finished' and status:
+            info = d.get('info_dict', {})
+            w, h = info.get('width'), info.get('height')
+            fmt = info.get('format', '')
+            if w and h:
+                status.log(f"  [下载] 完成 {w}×{h}  {fmt[:60]}")
 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
@@ -379,7 +385,7 @@ def extract_keyframes(video_path: Path, out_dir: Path,
         print(f"[截图] 场景检测关键帧（阈值={t}）...", flush=True)
         cmd = [
             _ffmpeg_bin('ffmpeg'), '-i', str(video_path),
-            '-vf', f'select=gt(scene\\,{t}),showinfo,scale=1920:-2',
+            '-vf', f'select=gt(scene\\,{t}),showinfo,scale=min(iw\\,1920):-2',
             '-vsync', 'vfr',
             '-q:v', '2',
             str(out_dir / 'frame_%05d.jpg'),
