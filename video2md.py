@@ -279,7 +279,12 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 ydl.download([url])
-            break
+            # 无异常，但要确认文件真的生成了
+            if list(sub_dir.glob('*.vtt')) or list(sub_dir.glob('*.srt')):
+                break  # 拿到字幕，停止重试
+            # 无文件（可能需要 Cookie 才能访问字幕 API），继续尝试
+            if status:
+                status.log(f"  [字幕] {label} 未返回字幕文件，继续尝试...")
         except Exception as e:
             s = str(e)
             is_browser = 'Cookie' in label
