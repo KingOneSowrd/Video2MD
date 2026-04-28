@@ -42,12 +42,11 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
     return opts
 
 
-def _apply_yt_client(opts: dict, url: str) -> dict:
-    """YouTube URL 注入客户端列表：ios 提供完整 DASH 格式且绕过 bot 检测，tv_embedded 兜底。"""
-    if _YT_RE.search(url):
-        opts.setdefault('extractor_args', {}) \
-            .setdefault('youtube', {})['player_client'] = ['ios', 'android', 'tv_embedded']
-    return opts
+_YT_BOT_RE = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
+
+def _yt_bot_fallback_opts() -> dict:
+    """bot 检测触发时的备用客户端 opts（画质可能降级但不被拦截）。"""
+    return {'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'tv_embedded']}}}
 
 
 def _ffmpeg_bin(name: str) -> str:
@@ -169,13 +168,14 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
-    _apply_yt_client(opts, src)
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(src, download=False)
-            return info.get('title', 'video'), float(info.get('duration', 0))
-    except Exception:
-        pass
+    for attempt_opts in [opts, {**opts, **_yt_bot_fallback_opts()}]:
+        try:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                info = ydl.extract_info(src, download=False)
+                return info.get('title', 'video'), float(info.get('duration', 0))
+        except Exception as e:
+            if not (_YT_RE.search(src) and _YT_BOT_RE.search(str(e))):
+                break  # 非 bot 检测错误，不重试
     return 'video', 0.0
 
 
@@ -194,7 +194,6 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
-    _apply_yt_client(opts, url)
     opts.update({
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -204,12 +203,17 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         'outtmpl': str(sub_dir / '%(title)s'),
     })
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        if status:
-            status.log(f"  [字幕] {str(e)[:120]}")
+    for attempt_opts in [opts, {**opts, **_yt_bot_fallback_opts()}]:
+        try:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                ydl.download([url])
+            break
+        except Exception as e:
+            err = str(e)
+            if not (_YT_RE.search(url) and _YT_BOT_RE.search(err)):
+                if status:
+                    status.log(f"  [字幕] {err[:120]}")
+                break
 
     vtt_files = list(sub_dir.glob('*.vtt')) + list(sub_dir.glob('*.srt'))
     if not vtt_files:
@@ -299,7 +303,6 @@ def download_video(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
-    _apply_yt_client(opts, url)
     opts.update({
         'format': (
             'bestvideo[height<=1080]+bestaudio/'
@@ -312,16 +315,28 @@ def download_video(url: str, work_dir: Path, status=None,
         'progress_hooks': [_hook],
     })
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except yt_dlp.utils.DownloadError as e:
-        err = str(e)
+    last_err = None
+    for attempt_opts in [opts, {**opts, **_yt_bot_fallback_opts()}]:
+        try:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                ydl.download([url])
+            last_err = None
+            break
+        except yt_dlp.utils.DownloadError as e:
+            last_err = e
+            err = str(e)
+            if not (_YT_RE.search(url) and _YT_BOT_RE.search(err)):
+                break  # 非 bot 检测，不重试
+            if status:
+                status.log("  [下载] bot 检测，切换备用客户端重试...")
+
+    if last_err:
+        err = str(last_err)
         if status:
             for line in err.splitlines()[-8:]:
                 if line.strip():
                     status.log(f"  [下载] {line.strip()}")
-        raise RuntimeError(f"yt-dlp 下载失败\n{err[-1200:]}") from e
+        raise RuntimeError(f"yt-dlp 下载失败\n{err[-1200:]}") from last_err
 
     candidates = list(work_dir.glob('video.*'))
     if not candidates:
