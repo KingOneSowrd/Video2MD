@@ -238,6 +238,14 @@ def safe_name(text: str, max_len: int = 60) -> str:
     return re.sub(r'[\\/:*?"<>|]', '_', text)[:max_len]
 
 
+class _SilentLogger:
+    """yt-dlp 日志全部静默，用于浏览器 Cookie 尝试避免噪音输出。"""
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
 def run(cmd, timeout=600, check=True, capture=True):
     return subprocess.run(
         cmd, capture_output=capture, text=True,
@@ -259,8 +267,9 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     if _BILI_RE.search(src):
         _apply_bili_headers(opts, src)
     for attempt_opts, label in _platform_fallback_chain(opts, src):
+        run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 info = ydl.extract_info(src, download=False)
                 return info.get('title', 'video'), float(info.get('duration', 0))
         except Exception as e:
@@ -298,8 +307,9 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
     })
 
     for attempt_opts, label in _subtitle_fallback_chain(opts, url):
+        run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 ydl.download([url])
             # 无异常，但要确认文件真的生成了
             if list(sub_dir.glob('*.vtt')) or list(sub_dir.glob('*.srt')):
@@ -423,8 +433,9 @@ def download_video(url: str, work_dir: Path, status=None,
 
     last_err = None
     for attempt_opts, label in _platform_fallback_chain(opts, url):
+        run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 ydl.download([url])
             last_err = None
             break
