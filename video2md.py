@@ -42,44 +42,56 @@ def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
     return opts
 
 
-_YT_BOT_RE    = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
+_YT_BOT_RE     = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
+_BILI_AUTH_RE  = re.compile(r'login|大会员|需要登录|请先登录|仅限|premium|vip|412', re.I)
 _COOKIE_ERR_RE = re.compile(r'cookie|keyring|could not copy|permission denied', re.I)
 
 
-def _yt_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
-    """
-    YouTube bot 检测触发时的重试链：
-    优先使用未启动的浏览器（DB 未锁），最后用移动端客户端（低画质）兜底。
-    """
-    if not _YT_RE.search(url):
-        return [(base_opts, '默认')]
+def _running_browsers() -> set[str]:
+    """返回当前正在运行的浏览器名称集合（Windows 专用，其他平台返回空集）。"""
+    if sys.platform != 'win32':
+        return set()
+    try:
+        out = subprocess.run(
+            ['tasklist', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, timeout=5
+        ).stdout.lower()
+        return {b for b, exe in [('chrome', 'chrome.exe'),
+                                  ('edge',   'msedge.exe'),
+                                  ('firefox','firefox.exe')]
+                if exe in out}
+    except Exception:
+        return set()
 
-    # 检测正在运行的浏览器（Windows: 用 tasklist；其他平台跳过检测）
-    running: set[str] = set()
-    if sys.platform == 'win32':
-        try:
-            out = subprocess.run(
-                ['tasklist', '/FO', 'CSV', '/NH'],
-                capture_output=True, text=True, timeout=5
-            ).stdout.lower()
-            for b, exe in [('chrome', 'chrome.exe'),
-                           ('edge',   'msedge.exe'),
-                           ('firefox','firefox.exe')]:
-                if exe in out:
-                    running.add(b)
-        except Exception:
-            pass
 
-    # 未运行的浏览器排前面，降低 DB 锁概率
+def _browser_cookie_chain(base_opts: dict) -> list[tuple[dict, str]]:
+    """返回按浏览器 Cookie 依次重试的 opts 列表（未运行的浏览器排前面）。"""
+    running  = _running_browsers()
     browsers = sorted(['chrome', 'edge', 'firefox'], key=lambda b: b in running)
+    return [({**base_opts, 'cookiesfrombrowser': (b, None, None, None)}, f'{b} Cookie')
+            for b in browsers]
 
+
+def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
+    """
+    YouTube / B站 认证失败时的自动重试链：
+    1. 默认（无 Cookie）
+    2. Chrome / Edge / Firefox Cookie（未运行的浏览器优先，降低 DB 锁概率）
+    3. 仅 YouTube：移动端客户端兜底（低画质但无需认证）
+    """
     chain: list[tuple[dict, str]] = [(base_opts, '默认')]
-    for b in browsers:
-        chain.append(({**base_opts, 'cookiesfrombrowser': (b, None, None, None)}, f'{b} Cookie'))
-    # 最后兜底：移动端客户端（不需要 Cookie，但画质可能降级）
-    chain.append(({**base_opts,
-                   'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'tv_embedded']}}},
-                  '备用客户端'))
+    is_yt   = bool(_YT_RE.search(url))
+    is_bili = bool(_BILI_RE.search(url))
+
+    if not (is_yt or is_bili):
+        return chain
+
+    chain += _browser_cookie_chain(base_opts)
+
+    if is_yt:
+        chain.append(({**base_opts,
+                       'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'tv_embedded']}}},
+                      '备用客户端'))
     return chain
 
 
@@ -202,14 +214,14 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         opts.setdefault('http_headers', {})['Referer'] = 'https://www.bilibili.com'
-    for attempt_opts, _ in _yt_fallback_chain(opts, src):
+    for attempt_opts, _ in _platform_fallback_chain(opts, src):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 info = ydl.extract_info(src, download=False)
                 return info.get('title', 'video'), float(info.get('duration', 0))
         except Exception as e:
             s = str(e)
-            if _YT_BOT_RE.search(s) or _COOKIE_ERR_RE.search(s):
+            if _YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s):
                 continue  # 尝试下一个
             break
     return 'video', 0.0
@@ -239,14 +251,14 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         'outtmpl': str(sub_dir / '%(title)s'),
     })
 
-    for attempt_opts, label in _yt_fallback_chain(opts, url):
+    for attempt_opts, label in _platform_fallback_chain(opts, url):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 ydl.download([url])
             break
         except Exception as e:
             s = str(e)
-            if _YT_BOT_RE.search(s) or _COOKIE_ERR_RE.search(s):
+            if _YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s):
                 if label != '默认' and status:
                     status.log(f"  [字幕] {label} 失败，继续尝试...")
                 continue
@@ -355,7 +367,7 @@ def download_video(url: str, work_dir: Path, status=None,
     })
 
     last_err = None
-    for attempt_opts, label in _yt_fallback_chain(opts, url):
+    for attempt_opts, label in _platform_fallback_chain(opts, url):
         try:
             with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 ydl.download([url])
@@ -364,7 +376,7 @@ def download_video(url: str, work_dir: Path, status=None,
         except yt_dlp.utils.DownloadError as e:
             last_err = e
             s = str(e)
-            if _YT_BOT_RE.search(s) or _COOKIE_ERR_RE.search(s):
+            if _YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s):
                 if label != '默认' and status:
                     status.log(f"  [下载] {label} 失败，继续尝试...")
                 continue
