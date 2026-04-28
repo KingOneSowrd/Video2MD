@@ -381,6 +381,7 @@ def extract_keyframes(video_path: Path, out_dir: Path,
             _ffmpeg_bin('ffmpeg'), '-i', str(video_path),
             '-vf', f'select=gt(scene\\,{t}),showinfo,scale=1920:-2',
             '-vsync', 'vfr',
+            '-q:v', '2',
             str(out_dir / 'frame_%05d.jpg'),
             '-hide_banner'
         ]
