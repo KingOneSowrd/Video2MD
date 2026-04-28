@@ -860,7 +860,7 @@ class CookiesPanel(Panel):
 
         self._input = QLineEdit()
         self._input.setFont(_mono(8))
-        self._input.setPlaceholderText("cookies.txt 路径（留空则自动读取）")
+        self._input.setPlaceholderText("cookies.txt 路径（留空则不使用 Cookie，B站登录内容须填写）")
         self._input.setStyleSheet(f"""
             QLineEdit {{
                 color: {_css(C_PRIMARY)};
@@ -896,7 +896,7 @@ class CookiesPanel(Panel):
         p = self._input.text().strip()
         if p and Path(p).exists():
             return ['--cookies', p]
-        return ['--cookies-from-browser', 'edge']
+        return []
 
 
 # ── Retro progress bar ────────────────────────────────────
@@ -1205,6 +1205,29 @@ class SetupWindow(QMainWindow):
         col.addWidget(self._w_status)
         self._w_log = glabel("", 7, color=C_DIM, glow_r=4)
         col.addWidget(self._w_log)
+        self._w_bar = RetroBar(indeterminate=True)
+        self._w_bar.setVisible(False)
+        col.addWidget(self._w_bar)
+
+        if not self._whisper_ok:
+            mr = QHBoxLayout(); mr.setSpacing(6)
+            mr.addWidget(glabel("镜像:", 7, color=C_DIM, glow_r=4))
+            self._w_mirror = QLineEdit()
+            self._w_mirror.setText('https://hf-mirror.com')
+            self._w_mirror.setFont(_mono(7))
+            self._w_mirror.setFixedHeight(18)
+            self._w_mirror.setStyleSheet(f"""
+                QLineEdit {{
+                    color: {_css(C_DIM)};
+                    background: rgba(20,5,0,180);
+                    border: 1px solid {_css(C_GRID)};
+                    padding: 1px 4px;
+                }}
+                QLineEdit:focus {{ border-color: {_css(C_DIM)}; }}
+            """)
+            mr.addWidget(self._w_mirror)
+            col.addLayout(mr)
+
         row.addLayout(col)
         row.addStretch()
 
@@ -1279,21 +1302,82 @@ class SetupWindow(QMainWindow):
         self._whisper_running = True
         self._dl_btn.setEnabled(False)
         self._w_status.setText("下载中...")
-        self._w_log.setText("正在连接 HuggingFace，请稍候...")
+        self._w_bar.setVisible(True)
+        self._w_current_file = ''
+
+        mirror = getattr(self, '_w_mirror', None)
+        mirror_url = (mirror.text().strip().rstrip('/') if mirror else '') \
+                     or 'https://hf-mirror.com'
+
+        self._w_poll_timer = QTimer(self)
+        self._w_poll_timer.timeout.connect(self._poll_whisper_size)
+        self._w_poll_timer.start(1000)
 
         def run():
-            try:
-                from faster_whisper.utils import download_model
-                QTimer.singleShot(0, lambda: self._w_log.setText("正在获取模型文件..."))
-                download_model('small')
-                QTimer.singleShot(0, lambda: self._on_whisper_done(True))
-            except Exception as e:
-                err = str(e)[:120]
-                QTimer.singleShot(0, lambda: self._on_whisper_done(False, err))
+            import os
+            import time
+            from huggingface_hub import hf_hub_download, list_repo_files
+
+            repo_id = 'Systran/faster-whisper-small'
+            attempts = [
+                (mirror_url, 1),
+                (mirror_url, 2),
+                ('https://huggingface.co', 1),
+            ]
+            last_err = ''
+            for endpoint, try_n in attempts:
+                try:
+                    os.environ['HF_ENDPOINT'] = endpoint
+                    host = endpoint.replace('https://', '')
+                    self._w_current_file = f"连接 {host}（第 {try_n} 次）..."
+
+                    files = [f for f in list_repo_files(repo_id)
+                             if not f.startswith('.')]
+                    total = len(files)
+
+                    for i, fname in enumerate(files, 1):
+                        self._w_current_file = f"文件 {i}/{total}: {fname}"
+                        hf_hub_download(repo_id, fname)
+
+                    QTimer.singleShot(0, lambda: self._on_whisper_done(True))
+                    return
+                except Exception as e:
+                    last_err = str(e)[:80]
+                    self._w_current_file = f"失败：{last_err}"
+                    if (endpoint, try_n) != attempts[-1]:
+                        time.sleep(3)
+
+            QTimer.singleShot(0, lambda: self._on_whisper_done(
+                False, f"多次重试均失败：{last_err}"))
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _poll_whisper_size(self):
+        import os
+        hf_home = Path(os.environ.get('HF_HOME',
+                       str(Path.home() / '.cache' / 'huggingface')))
+        blobs_dir = hf_home / 'hub' / 'models--Systran--faster-whisper-small' / 'blobs'
+        file_info = getattr(self, '_w_current_file', '')
+        if not blobs_dir.exists():
+            if file_info:
+                self._w_log.setText(file_info)
+            return
+        try:
+            total = sum(f.stat().st_size for f in blobs_dir.iterdir() if f.is_file())
+            mb = total / 1_048_576
+            if file_info:
+                self._w_log.setText(f"{file_info}  ({mb:.0f} MB 已缓存)")
+            else:
+                self._w_log.setText(f"已缓存 {mb:.0f} MB")
+        except Exception:
+            if file_info:
+                self._w_log.setText(file_info)
+
     def _on_whisper_done(self, success: bool, err: str = ''):
+        if hasattr(self, '_w_poll_timer'):
+            self._w_poll_timer.stop()
+        self._w_bar.setVisible(False)
+        self._w_current_file = ''
         self._whisper_running = False
         if success:
             self._whisper_ok = True
