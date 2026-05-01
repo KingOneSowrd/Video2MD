@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +41,9 @@ import video2md  # portable: in-process processing
 
 STATUS_FILE  = Path.home() / '.video2md_status.json'
 MONITOR_CFG  = Path.home() / '.video2md_monitor.json'
+DEFAULT_MAX_TASKS = 5
+MIN_MAX_TASKS = 1
+MAX_MAX_TASKS = 32
 
 def _cfg_load() -> dict:
     try:
@@ -47,13 +51,20 @@ def _cfg_load() -> dict:
     except Exception:
         return {}
 
-def _cfg_save(key: str, value: str):
+def _cfg_save(key: str, value):
     cfg = _cfg_load()
     cfg[key] = value
     try:
         MONITOR_CFG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
     except Exception:
         pass
+
+def _cfg_int(key: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(_cfg_load().get(key, default))
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
 
 # ── Paths ─────────────────────────────────────────────────
 RAW_SOURCES = Path(_cfg_load().get('output_dir',
@@ -708,6 +719,98 @@ def _retro_btn(text: str, color=None) -> QPushButton:
         }}
     """)
     return btn
+
+
+class RetroStepper(QWidget):
+    valueChanged = pyqtSignal(int)
+
+    def __init__(self, minimum: int, maximum: int, value: int, parent=None):
+        super().__init__(parent)
+        self._min = minimum
+        self._max = maximum
+        self._value = minimum
+        self.setFixedSize(58, 22)
+        self.setStyleSheet("background: transparent;")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._value_lbl = QLabel()
+        self._value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._value_lbl.setFont(_mono(8, bold=True))
+        self._value_lbl.setFixedSize(34, 22)
+        self._value_lbl.setStyleSheet(f"""
+            QLabel {{
+                color: {_css(C_PRIMARY)};
+                background: rgba(20,5,0,200);
+                border: 1px solid {_css(C_DIM)};
+                border-right: none;
+            }}
+        """)
+        self._value_lbl.setGraphicsEffect(_glow(C_PRIMARY, 6))
+        lay.addWidget(self._value_lbl)
+
+        arrows = QVBoxLayout()
+        arrows.setContentsMargins(0, 0, 0, 0)
+        arrows.setSpacing(0)
+        self._up_btn = self._arrow_btn("▲")
+        self._down_btn = self._arrow_btn("▼")
+        self._up_btn.clicked.connect(lambda: self._bump(1))
+        self._down_btn.clicked.connect(lambda: self._bump(-1))
+        arrows.addWidget(self._up_btn)
+        arrows.addWidget(self._down_btn)
+        lay.addLayout(arrows)
+
+        self.setValue(value, emit=False)
+
+    def _arrow_btn(self, text: str) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setFont(_mono(6, bold=True))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedSize(24, 11)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {_css(C_DIM)};
+                background: rgba(20,5,0,200);
+                border: 1px solid {_css(C_DIM)};
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                color: {_css(C_PRIMARY)};
+                border-color: {_css(C_PRIMARY)};
+            }}
+            QPushButton:pressed {{
+                color: {_css(C_BRIGHT)};
+                background: rgba(255,88,0,42);
+            }}
+            QPushButton:disabled {{
+                color: {_css(QColor(60,18,0))};
+                border-color: {_css(QColor(60,18,0))};
+                background: rgba(10,2,0,160);
+            }}
+        """)
+        return btn
+
+    def _bump(self, delta: int):
+        self.setValue(self._value + delta)
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, value: int, emit: bool = True):
+        value = max(self._min, min(self._max, int(value)))
+        if value == self._value:
+            self._value_lbl.setText(f"{value:02d}")
+            self._up_btn.setEnabled(value < self._max)
+            self._down_btn.setEnabled(value > self._min)
+            return
+        self._value = value
+        self._value_lbl.setText(f"{value:02d}")
+        self._up_btn.setEnabled(value < self._max)
+        self._down_btn.setEnabled(value > self._min)
+        if emit:
+            self.valueChanged.emit(value)
 
 
 # ── Input panel (drag-drop + URL entry) ───────────────────
@@ -1444,6 +1547,9 @@ class MainWindow(QMainWindow):
         self._last_sig = None
         self._task_states: dict[str, str] = {}
         self._active_srcs: set[str] = set()
+        self._queue_lock = threading.Lock()
+        self._pending_jobs: list[dict] = []
+        self._active_jobs: set[str] = set()
 
         self._sounds = SoundPlayer(self)
 
@@ -1539,6 +1645,16 @@ class MainWindow(QMainWindow):
             8, color=C_DIM, glow_r=5)
         sb.addWidget(self._stats_lbl); sb.addStretch()
 
+        sb.addWidget(glabel("并行任务数:", 8, color=C_DIM, glow_r=5))
+        self._max_tasks_spin = RetroStepper(
+            MIN_MAX_TASKS,
+            MAX_MAX_TASKS,
+            _cfg_int('max_tasks', DEFAULT_MAX_TASKS, MIN_MAX_TASKS, MAX_MAX_TASKS),
+        )
+        self._max_tasks_spin.setToolTip("同时处理的任务上限")
+        self._max_tasks_spin.valueChanged.connect(self._on_max_tasks_changed)
+        sb.addWidget(self._max_tasks_spin); sb.addSpacing(8)
+
         clear_btn = _retro_btn("清除完成", C_DIM)
         clear_btn.clicked.connect(self._clear_done)
         sb.addWidget(clear_btn); sb.addSpacing(8)
@@ -1620,6 +1736,63 @@ class MainWindow(QMainWindow):
             e.accept()
 
     # ── Spawn: launch in-process thread ──────────────────
+    def _on_max_tasks_changed(self, value: int):
+        _cfg_save('max_tasks', int(value))
+        self._dispatch_pending()
+
+    def _max_tasks(self) -> int:
+        if hasattr(self, '_max_tasks_spin'):
+            return int(self._max_tasks_spin.value())
+        return _cfg_int('max_tasks', DEFAULT_MAX_TASKS, MIN_MAX_TASKS, MAX_MAX_TASKS)
+
+    def _read_tasks(self) -> list[dict]:
+        if not STATUS_FILE.exists():
+            return []
+        try:
+            return json.loads(STATUS_FILE.read_text(encoding='utf-8')).get("tasks", [])
+        except Exception:
+            return []
+
+    def _write_tasks(self, tasks: list[dict]):
+        try:
+            STATUS_FILE.write_text(
+                json.dumps({'tasks': tasks}, ensure_ascii=False, indent=2),
+                encoding='utf-8',
+            )
+        except Exception:
+            pass
+
+    def _upsert_task(self, task: dict):
+        tasks = self._read_tasks()
+        for i, old in enumerate(tasks):
+            if old.get('id') == task.get('id'):
+                tasks[i] = task
+                break
+        else:
+            tasks.append(task)
+        self._write_tasks(tasks)
+        self._last_sig = None
+
+    def _queued_title(self, src: str) -> str:
+        p = Path(src)
+        if p.exists():
+            return p.stem or p.name
+        return src[:70] or 'video'
+
+    def _mark_dispatched(self, task_id: str):
+        tasks = self._read_tasks()
+        changed = False
+        for task in tasks:
+            if task.get('id') == task_id and task.get('status') == 'queued':
+                task['status'] = 'processing'
+                task['step'] = 'queued'
+                task.setdefault('log', []).append("[队列] 已获得处理槽位")
+                changed = True
+                break
+        if changed:
+            self._write_tasks(tasks)
+            self._last_sig = None
+
     def _spawn(self, src: str):
         src = src.strip().strip('"').strip("'")
         if not src:
@@ -1635,23 +1808,63 @@ class MainWindow(QMainWindow):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         extra_ydl: list[str] = self._cookies_panel.cookies_args()
+        task_id = str(uuid.uuid4())[:8]
+        task = {
+            "id": task_id,
+            "title": self._queued_title(src),
+            "source": src,
+            "status": "queued",
+            "step": "queued",
+            "step_label": "",
+            "progress": 0.0,
+            "frames": None,
+            "segments": None,
+            "output_md": None,
+            "log": [f"[排队] 等待可用处理槽位（并发上限 {self._max_tasks()}）"],
+            "added_at": datetime.now().strftime("%H:%M:%S"),
+            "finished_at": None,
+            "error": None,
+        }
+        self._upsert_task(task)
+        with self._queue_lock:
+            self._pending_jobs.append({
+                'id': task_id,
+                'src': src,
+                'out_dir': out_dir,
+                'extra_ydl': extra_ydl,
+            })
 
         self._log.append(
             f'<span style="color:{_css(C_PRIMARY)};">'
             f'[{datetime.now().strftime("%H:%M:%S")}] 已投喂: {src[:70]}</span>'
         )
-        threading.Thread(
-            target=self._worker,
-            args=(src, out_dir, extra_ydl),
-            daemon=True,
-        ).start()
+        self._dispatch_pending()
 
-    def _worker(self, src: str, out_dir: Path, extra_ydl: list[str]):
+    # ── Queue dispatch ────────────────────────────────────
+    def _dispatch_pending(self):
+        while True:
+            with self._queue_lock:
+                if len(self._active_jobs) >= self._max_tasks() or not self._pending_jobs:
+                    return
+                job = self._pending_jobs.pop(0)
+                self._active_jobs.add(job['id'])
+
+            self._mark_dispatched(job['id'])
+            threading.Thread(
+                target=self._worker,
+                args=(job['id'], job['src'], job['out_dir'], job['extra_ydl']),
+                daemon=True,
+            ).start()
+
+    def _worker(self, task_id: str, src: str, out_dir: Path, extra_ydl: list[str]):
         """在后台线程中调用 video2md.process_video()。"""
         try:
-            video2md.process_video(src, out_dir, extra_ydl=extra_ydl)
+            video2md.process_video(src, out_dir, extra_ydl=extra_ydl, task_id=task_id)
         except Exception:
-            pass  # StatusWriter 已写入 error 状态，monitor 会自动显示
+            pass  # StatusWriter 已写入 error 状态，monitor 会自动显示。
+        finally:
+            with self._queue_lock:
+                self._active_jobs.discard(task_id)
 
     # ── Startup cleanup ───────────────────────────────────
     def _clear_status_file(self):
@@ -1665,6 +1878,8 @@ class MainWindow(QMainWindow):
 
     # ── Task management ───────────────────────────────────
     def _remove_task(self, task_id: str):
+        with self._queue_lock:
+            self._pending_jobs = [j for j in self._pending_jobs if j.get('id') != task_id]
         if not STATUS_FILE.exists():
             return
         try:
@@ -1789,6 +2004,7 @@ class MainWindow(QMainWindow):
                 tasks = json.loads(STATUS_FILE.read_text(encoding='utf-8')).get("tasks", [])
             except Exception:
                 pass
+        self._dispatch_pending()
 
         for t in tasks:
             tid  = t.get('id')
@@ -1832,7 +2048,7 @@ class MainWindow(QMainWindow):
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._q_lay.insertWidget(0, lbl)
         else:
-            for i, t in enumerate(reversed(tasks)):
+            for i, t in enumerate(tasks):
                 self._q_lay.insertWidget(
                     i, TaskRow(t,
                                on_remove=self._remove_task,

@@ -30,6 +30,7 @@ _YT_RE   = re.compile(r'youtube\.com|youtu\.be', re.I)
 
 _cancel_events: dict  = {}   # task_id -> threading.Event
 _status_writers: dict = {}   # task_id -> StatusWriter
+_status_lock = threading.Lock()
 
 
 def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
@@ -476,19 +477,24 @@ class StatusWriter:
     def _flush(self):
         if self.cancelled:
             return
-        try:
-            tasks = []
-            if STATUS_FILE.exists():
-                try:
-                    tasks = json.loads(STATUS_FILE.read_text(encoding='utf-8')).get("tasks", [])
-                except Exception:
-                    tasks = []
-            tasks = [t for t in tasks if t.get("id") != self.task_id]
-            tasks.append(self._data)
-            STATUS_FILE.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False, indent=2),
-                                   encoding='utf-8')
-        except Exception:
-            pass
+        with _status_lock:
+            try:
+                tasks = []
+                if STATUS_FILE.exists():
+                    try:
+                        tasks = json.loads(STATUS_FILE.read_text(encoding='utf-8')).get("tasks", [])
+                    except Exception:
+                        tasks = []
+                for i, task in enumerate(tasks):
+                    if task.get("id") == self.task_id:
+                        tasks[i] = self._data
+                        break
+                else:
+                    tasks.append(self._data)
+                STATUS_FILE.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False, indent=2),
+                                       encoding='utf-8')
+            except Exception:
+                pass
 
 
 # ─────────────────────────── 工具函数 ────────────────────────────
@@ -943,13 +949,29 @@ def build_markdown(title: str, source: str,
 
 def process_video(src: str, out_dir: Path, model: str = 'medium',
                   lang: str | None = None, threshold: float = 0.5,
-                  extra_ydl: list[str] | None = None):
+                  extra_ydl: list[str] | None = None,
+                  task_id: str | None = None):
     """
     供 monitor.py import 并在线程中调用。
     out_dir: 输出目录，文件名由视频标题自动生成。
     """
     is_local = Path(src).exists()
-    title, duration = get_video_info(src, extra_ydl)
+    initial_title = Path(src).stem if is_local else (src[:70] or 'video')
+    sw = StatusWriter(task_id or str(uuid.uuid4())[:8], initial_title, src)
+    # 注册取消机制，先于网络探测，保证 GUI 中刚启动的任务也能取消。
+    cancel_ev = threading.Event()
+    _cancel_events[sw.task_id] = cancel_ev
+    _status_writers[sw.task_id] = sw
+
+    try:
+        title, duration = get_video_info(src, extra_ydl)
+    except Exception as exc:
+        sw.error(str(exc))
+        _cancel_events.pop(sw.task_id, None)
+        _status_writers.pop(sw.task_id, None)
+        raise
+    sw._data['title'] = title
+    sw._flush()
 
     print(f"\n{'='*40}")
     print(f"标题：{title}")
@@ -960,11 +982,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     asset_dir = out_md.parent / f"{out_md.stem}_assets"
     asset_dir_name = asset_dir.name
 
-    sw = StatusWriter(str(uuid.uuid4())[:8], title, src)
-    # 注册取消机制，并将输出路径写入状态供取消时清理
-    cancel_ev = threading.Event()
-    _cancel_events[sw.task_id] = cancel_ev
-    _status_writers[sw.task_id] = sw
+    # 将输出路径写入状态供取消时清理。
     sw._data['pending_output_md']  = str(out_md)
     sw._data['pending_asset_dir']  = str(asset_dir)
     sw._flush()
@@ -973,6 +991,8 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     sw.log(f"时长：{fmt_time(duration) if duration else '未知'}")
 
     try:
+        if cancel_ev.is_set():
+            raise RuntimeError('cancelled')
         with tempfile.TemporaryDirectory(prefix='video2md_') as tmp:
             work = Path(tmp)
             segments = None
