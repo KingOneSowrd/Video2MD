@@ -25,7 +25,7 @@ jobs:
         uses: FedericoCarboni/setup-ffmpeg@v3
 
       - name: Install Python dependencies
-        run: pip install pyqt6 pyqt6-qt6 pyqt6-sip faster-whisper yt-dlp pyinstaller numpy tokenizers sentencepiece
+        run: pip install pyqt6 pyqt6-qt6 pyqt6-sip faster-whisper yt-dlp pyinstaller pillow numpy tokenizers sentencepiece
 
       - name: Build EXE
         run: python build.py
