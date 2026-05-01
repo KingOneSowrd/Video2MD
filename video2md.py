@@ -13,10 +13,12 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -152,6 +154,25 @@ def _cache_dir() -> Path:
     d = base / 'cache'
     d.mkdir(exist_ok=True)
     return d
+
+
+def _runtime_cache_dir() -> Path:
+    """返回运行期临时文件目录：cache/tmp/。"""
+    d = _cache_dir() / 'tmp'
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def cleanup_runtime_cache(max_age_hours: float = 24.0) -> None:
+    """清理异常退出遗留的运行期临时目录；正常任务由 TemporaryDirectory 自动删除。"""
+    root = _runtime_cache_dir()
+    cutoff = time.time() - max_age_hours * 3600
+    for path in root.glob('video2md_*'):
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _ffmpeg_bin(name: str) -> str:
@@ -955,6 +976,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     供 monitor.py import 并在线程中调用。
     out_dir: 输出目录，文件名由视频标题自动生成。
     """
+    cleanup_runtime_cache()
     is_local = Path(src).exists()
     initial_title = Path(src).stem if is_local else (src[:70] or 'video')
     sw = StatusWriter(task_id or str(uuid.uuid4())[:8], initial_title, src)
@@ -993,7 +1015,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     try:
         if cancel_ev.is_set():
             raise RuntimeError('cancelled')
-        with tempfile.TemporaryDirectory(prefix='video2md_') as tmp:
+        with tempfile.TemporaryDirectory(prefix='video2md_', dir=_runtime_cache_dir()) as tmp:
             work = Path(tmp)
             segments = None
             video_path = Path(src) if is_local else None
@@ -1016,9 +1038,9 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
             if cancel_ev.is_set():
                 raise RuntimeError('cancelled')
 
-            # 字幕缓存：统一存到 EXE 同目录 cache/，处理完自动删除
+            # 字幕中转缓存：放在本次运行临时目录内，任务结束自动删除。
             cache_key = Path(src).stem if is_local else safe_name(title)
-            seg_cache = _cache_dir() / f"{cache_key}_segments.json"
+            seg_cache = work / f"{cache_key}_segments.json"
 
             if segments is None and seg_cache.exists():
                 sw.update("cached_segments", "[字幕] 加载缓存...", 0.08)
@@ -1054,7 +1076,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
             out_md.parent.mkdir(parents=True, exist_ok=True)
             out_md.write_text(md, encoding='utf-8')
 
-            # 处理成功后删除字幕缓存（失败时保留，供下次断点续用）
+            # 运行期中转文件在 TemporaryDirectory 退出时统一清理。
             try:
                 seg_cache.unlink(missing_ok=True)
             except Exception:
