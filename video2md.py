@@ -828,10 +828,27 @@ def transcribe(audio_path: Path, model_size: str, lang: str | None,
 
 # ─────────────────────────── 关键帧提取 ──────────────────────────
 
+SCREENSHOT_FREQUENCY_THRESHOLDS = {
+    'Small': 0.5,
+    'Medium': 0.4,
+    'High': 0.3,
+    'Max': 0.12,
+}
+DEFAULT_SCREENSHOT_FREQUENCY = 'Small'
+
+
+def screenshot_threshold(frequency: str | None = None, threshold: float | None = None) -> float:
+    if threshold is not None:
+        return float(threshold)
+    if frequency in SCREENSHOT_FREQUENCY_THRESHOLDS:
+        return SCREENSHOT_FREQUENCY_THRESHOLDS[frequency]
+    return SCREENSHOT_FREQUENCY_THRESHOLDS[DEFAULT_SCREENSHOT_FREQUENCY]
+
+
 def extract_keyframes(video_path: Path, out_dir: Path,
-                      threshold: float = 0.5, max_frames: int = 60):
+                      threshold: float = 0.5):
     """
-    自适应场景检测：帧数不足时自动降低阈值重试，最终均匀采样到 max_frames。
+    场景检测关键帧提取。threshold 越小，截图越多。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -861,22 +878,10 @@ def extract_keyframes(video_path: Path, out_dir: Path,
 
     frames = _detect(threshold)
 
-    # 帧数不足时依次降低阈值重试
-    if len(frames) < 15:
-        for lower in [0.3, 0.2, 0.12]:
-            frames = _detect(lower)
-            if len(frames) >= 15:
-                break
-
     # 仍不足则改用间隔截图兜底
     if not frames:
         print("  → 无场景变化，改用间隔截图（每30秒）。", flush=True)
         return _interval_frames(video_path, out_dir)
-
-    # 均匀采样到 max_frames（修正原 step=1 不削减的 bug）
-    if len(frames) > max_frames:
-        indices = [int(i * len(frames) / max_frames) for i in range(max_frames)]
-        frames = [frames[i] for i in indices]
 
     print(f"  → {len(frames)} 帧", flush=True)
     return frames
@@ -969,9 +974,10 @@ def build_markdown(title: str, source: str,
 # ─────────────────────────── 主处理函数 ──────────────────────────
 
 def process_video(src: str, out_dir: Path, model: str = 'medium',
-                  lang: str | None = None, threshold: float = 0.5,
+                  lang: str | None = None, threshold: float | None = None,
                   extra_ydl: list[str] | None = None,
-                  task_id: str | None = None):
+                  task_id: str | None = None,
+                  screenshot_frequency: str | None = None):
     """
     供 monitor.py import 并在线程中调用。
     out_dir: 输出目录，文件名由视频标题自动生成。
@@ -986,6 +992,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     _status_writers[sw.task_id] = sw
 
     try:
+        threshold = screenshot_threshold(screenshot_frequency, threshold)
         title, duration = get_video_info(src, extra_ydl)
     except Exception as exc:
         sw.error(str(exc))
@@ -1114,7 +1121,10 @@ def main():
                     choices=['tiny', 'base', 'small', 'medium', 'large-v3'],
                     help='Whisper 模型大小（默认 small）')
     ap.add_argument('--lang', default=None, help='语言提示，如 zh / en')
-    ap.add_argument('--threshold', default=0.5, type=float,
+    ap.add_argument('--screenshot-frequency', default=DEFAULT_SCREENSHOT_FREQUENCY,
+                    choices=list(SCREENSHOT_FREQUENCY_THRESHOLDS.keys()),
+                    help='截图频率档位：Small=0.5, Medium=0.4, High=0.3, Max=0.12')
+    ap.add_argument('--threshold', default=None, type=float,
                     help='场景切换阈值 0~1（默认 0.5，越小截图越多）')
     ap.add_argument('--cookies-from-browser', default=None, metavar='BROWSER',
                     help='从浏览器读取 Cookie（chrome/edge/firefox），解决 B站 412')
@@ -1140,10 +1150,12 @@ def main():
         asset_dir = out_md.parent / f"{out_md.stem}_assets"
 
         sw = StatusWriter(str(uuid.uuid4())[:8], title, src)
-        process_video(src, out_md.parent, args.model, args.lang, args.threshold, extra_ydl)
+        process_video(src, out_md.parent, args.model, args.lang, args.threshold, extra_ydl,
+                      screenshot_frequency=args.screenshot_frequency)
     else:
         out_dir = Path(args.outdir) if args.outdir else Path('.')
-        process_video(args.input, out_dir, args.model, args.lang, args.threshold, extra_ydl)
+        process_video(args.input, out_dir, args.model, args.lang, args.threshold, extra_ydl,
+                      screenshot_frequency=args.screenshot_frequency)
 
 
 if __name__ == '__main__':

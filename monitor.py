@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                               QScrollArea, QFrame, QTextEdit,
                               QGraphicsDropShadowEffect, QPushButton,
                               QLineEdit, QMenu, QSystemTrayIcon,
-                              QFileDialog)
+                              QFileDialog, QComboBox)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 
 import webbrowser
@@ -44,6 +44,8 @@ MONITOR_CFG  = Path.home() / '.video2md_monitor.json'
 DEFAULT_MAX_TASKS = 5
 MIN_MAX_TASKS = 1
 MAX_MAX_TASKS = 32
+SCREENSHOT_FREQUENCY_DEFAULT = video2md.DEFAULT_SCREENSHOT_FREQUENCY
+SCREENSHOT_FREQUENCIES = tuple(video2md.SCREENSHOT_FREQUENCY_THRESHOLDS.keys())
 
 def _cfg_load() -> dict:
     try:
@@ -65,6 +67,10 @@ def _cfg_int(key: str, default: int, minimum: int, maximum: int) -> int:
     except Exception:
         value = default
     return max(minimum, min(maximum, value))
+
+def _cfg_choice(key: str, default: str, choices: tuple[str, ...]) -> str:
+    value = str(_cfg_load().get(key, default))
+    return value if value in choices else default
 
 # ── Paths ─────────────────────────────────────────────────
 RAW_SOURCES = Path(_cfg_load().get('output_dir',
@@ -1655,6 +1661,42 @@ class MainWindow(QMainWindow):
         self._max_tasks_spin.valueChanged.connect(self._on_max_tasks_changed)
         sb.addWidget(self._max_tasks_spin); sb.addSpacing(8)
 
+        sb.addWidget(glabel("截图频率", 8, color=C_DIM, glow_r=5))
+        self._shot_freq_combo = QComboBox()
+        self._shot_freq_combo.addItems(SCREENSHOT_FREQUENCIES)
+        self._shot_freq_combo.setCurrentText(_cfg_choice(
+            'screenshot_frequency',
+            SCREENSHOT_FREQUENCY_DEFAULT,
+            SCREENSHOT_FREQUENCIES,
+        ))
+        self._shot_freq_combo.setToolTip("Small=0.5, Medium=0.4, High=0.3, Max=0.12")
+        self._shot_freq_combo.setFixedSize(88, 22)
+        self._shot_freq_combo.setFont(_mono(8, bold=True))
+        self._shot_freq_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._shot_freq_combo.setStyleSheet(f"""
+            QComboBox {{
+                color: {_css(C_PRIMARY)};
+                background: rgba(20,5,0,200);
+                border: 1px solid {_css(C_DIM)};
+                padding: 0 6px;
+            }}
+            QComboBox:hover {{
+                border-color: {_css(C_PRIMARY)};
+            }}
+            QComboBox::drop-down {{
+                width: 18px;
+                border-left: 1px solid {_css(C_DIM)};
+            }}
+            QComboBox QAbstractItemView {{
+                color: {_css(C_PRIMARY)};
+                background: {_css(QColor(20,5,0))};
+                border: 1px solid {_css(C_DIM)};
+                selection-background-color: rgba(255,88,0,60);
+            }}
+        """)
+        self._shot_freq_combo.currentTextChanged.connect(self._on_screenshot_frequency_changed)
+        sb.addWidget(self._shot_freq_combo); sb.addSpacing(8)
+
         clear_btn = _retro_btn("清除完成", C_DIM)
         clear_btn.clicked.connect(self._clear_done)
         sb.addWidget(clear_btn); sb.addSpacing(8)
@@ -1745,6 +1787,21 @@ class MainWindow(QMainWindow):
             return int(self._max_tasks_spin.value())
         return _cfg_int('max_tasks', DEFAULT_MAX_TASKS, MIN_MAX_TASKS, MAX_MAX_TASKS)
 
+    def _on_screenshot_frequency_changed(self, value: str):
+        if value in SCREENSHOT_FREQUENCIES:
+            _cfg_save('screenshot_frequency', value)
+
+    def _screenshot_frequency(self) -> str:
+        if hasattr(self, '_shot_freq_combo'):
+            value = self._shot_freq_combo.currentText()
+            if value in SCREENSHOT_FREQUENCIES:
+                return value
+        return _cfg_choice(
+            'screenshot_frequency',
+            SCREENSHOT_FREQUENCY_DEFAULT,
+            SCREENSHOT_FREQUENCIES,
+        )
+
     def _read_tasks(self) -> list[dict]:
         if not STATUS_FILE.exists():
             return []
@@ -1808,6 +1865,7 @@ class MainWindow(QMainWindow):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         extra_ydl: list[str] = self._cookies_panel.cookies_args()
+        screenshot_frequency = self._screenshot_frequency()
         task_id = str(uuid.uuid4())[:8]
         task = {
             "id": task_id,
@@ -1832,6 +1890,7 @@ class MainWindow(QMainWindow):
                 'src': src,
                 'out_dir': out_dir,
                 'extra_ydl': extra_ydl,
+                'screenshot_frequency': screenshot_frequency,
             })
 
         self._log.append(
@@ -1852,14 +1911,22 @@ class MainWindow(QMainWindow):
             self._mark_dispatched(job['id'])
             threading.Thread(
                 target=self._worker,
-                args=(job['id'], job['src'], job['out_dir'], job['extra_ydl']),
+                args=(job['id'], job['src'], job['out_dir'], job['extra_ydl'],
+                      job['screenshot_frequency']),
                 daemon=True,
             ).start()
 
-    def _worker(self, task_id: str, src: str, out_dir: Path, extra_ydl: list[str]):
+    def _worker(self, task_id: str, src: str, out_dir: Path, extra_ydl: list[str],
+                screenshot_frequency: str):
         """在后台线程中调用 video2md.process_video()。"""
         try:
-            video2md.process_video(src, out_dir, extra_ydl=extra_ydl, task_id=task_id)
+            video2md.process_video(
+                src,
+                out_dir,
+                extra_ydl=extra_ydl,
+                task_id=task_id,
+                screenshot_frequency=screenshot_frequency,
+            )
         except Exception:
             pass  # StatusWriter 已写入 error 状态，monitor 会自动显示。
         finally:
