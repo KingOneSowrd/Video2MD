@@ -30,7 +30,7 @@
 1. 打开 `VideoIngestMonitor.exe`
 2. 将视频 URL 或本地文件拖入输入框，回车 或 点「DISPATCH」
 3. 等待处理完成，点「打开」查看输出的 Markdown 文件
-4. 处理中的任务可点「×」随时取消（同时删除已生成的中间文件）
+4. 处理中的任务可点「Ⅱ」暂停、「▶」继续，点「×」取消（同时删除已生成的中间文件）
 
 **支持来源：**
 - B站视频链接（含分享文本格式 `标题 + URL`）
@@ -56,17 +56,17 @@ Markdown 示例：
 
 ---
 
-## B站说明
+## Cookie 说明
 
-处理 B站视频时，如需获取 **AI 字幕**或访问登录后才可见的内容，需提供 Cookie 文件。
+处理 B站 / YouTube 视频时，如需获取登录态字幕或遇到平台验证，需提供 Cookie。GUI 支持填写一个 Cookie 文件夹，并按网站自动选择对应文件。
 
 **导出步骤：**
 
 1. 浏览器安装 [Cookie-Editor](https://cookie-editor.com/) 扩展（支持 Chrome / Edge / Firefox）
-2. 登录 B站后，点击扩展图标
+2. 登录 B站或 YouTube 后，点击扩展图标
 3. 右下角点「Export」→ 选择格式 **Netscape**
-4. 保存为 `bilibili_cookies.txt`
-5. 在工具「Cookie 文件」栏点「◉ 浏览」选择该文件
+4. 分别保存为容易识别的文件名，例如 `bilibili.txt`、`Youtube.txt`
+5. 在工具「Cookie 文件夹」栏点「◉ 浏览」选择这些文件所在的文件夹
 
 路径会持久化保存，下次启动自动加载。
 
@@ -91,7 +91,7 @@ Markdown 示例：
 需要 Python 3.10+：
 
 ```bash
-pip install pyqt6 faster-whisper yt-dlp pyinstaller numpy
+pip install pyqt6 faster-whisper "yt-dlp[default]" yt-dlp-ejs pyinstaller numpy
 python build.py
 # 输出：dist/VideoIngestMonitor/
 ```

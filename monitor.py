@@ -956,10 +956,10 @@ class OutputPanel(Panel):
 
 # ── Cookies file panel ───────────────────────────────────
 class CookiesPanel(Panel):
-    """Optional cookies.txt file picker (avoids browser DB lock)."""
+    """Optional cookie file/folder picker (avoids browser DB lock)."""
 
     def __init__(self, parent=None):
-        super().__init__("Cookie 文件（B站 / YouTube 等需要）", parent)
+        super().__init__("Cookie 文件夹（按网站自动选择）", parent)
         self.setAcceptDrops(True)
         self.setFixedHeight(52)
 
@@ -969,7 +969,7 @@ class CookiesPanel(Panel):
 
         self._input = QLineEdit()
         self._input.setFont(_mono(8))
-        self._input.setPlaceholderText("cookies.txt 路径（留空则不使用 Cookie，B站登录内容须填写）")
+        self._input.setPlaceholderText("Cookie 文件夹路径（也兼容单个 cookies.txt）")
         self._input.setStyleSheet(f"""
             QLineEdit {{
                 color: {_css(C_PRIMARY)};
@@ -992,19 +992,69 @@ class CookiesPanel(Panel):
         lay.addWidget(btn)
 
     def _browse(self):
-        start = self._input.text().strip() or str(Path.home())
-        f, _ = QFileDialog.getOpenFileName(
-            self, "选择 cookies.txt", start, "文本文件 (*.txt);;所有文件 (*)"
-        )
-        if f:
-            self._input.setText(f)
-            _cfg_save('cookies_path', f)
+        current = self._input.text().strip()
+        start = Path(current) if current else Path.home()
+        if start.is_file():
+            start = start.parent
+        d = QFileDialog.getExistingDirectory(self, "选择 Cookie 文件夹", str(start))
+        if d:
+            self._input.setText(d)
+            _cfg_save('cookies_path', d)
 
-    def cookies_args(self) -> list[str]:
+    def _cookie_keywords(self, src: str) -> list[str]:
+        if re.search(r'youtube\.com|youtu\.be', src, re.I):
+            return ['youtube', 'youtu', 'google']
+        if re.search(r'bilibili\.com|b23\.tv', src, re.I):
+            return ['bilibili', 'bili', 'b23']
+        return []
+
+    def _cookie_from_dir(self, folder: Path, src: str) -> Path | None:
+        keywords = self._cookie_keywords(src)
+        if not keywords:
+            return None
+        files = [p for p in folder.iterdir() if p.is_file()]
+        txt_files = [p for p in files if p.suffix.lower() in ('.txt', '.cookies')]
+        pool = txt_files or files
+        for keyword in keywords:
+            exact = next((p for p in pool if p.stem.lower() == keyword), None)
+            if exact:
+                return exact
+        for keyword in keywords:
+            partial = next((p for p in pool if keyword in p.name.lower()), None)
+            if partial:
+                return partial
+        return None
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        for url in e.mimeData().urls():
+            p = url.toLocalFile()
+            if p:
+                self._input.setText(p)
+                _cfg_save('cookies_path', p)
+                break
+
+    def cookies_args(self, src: str = '') -> list[str]:
         """返回传给 video2md.process_video() 的 extra_ydl 参数列表。"""
         p = self._input.text().strip()
-        if p and Path(p).exists():
-            return ['--cookies', p]
+        if not p:
+            return []
+        path = Path(p)
+        if path.is_file():
+            sibling = self._cookie_from_dir(path.parent, src) if src else None
+            if sibling:
+                return ['--cookies', str(sibling)]
+            return ['--cookies', str(path)]
+        if path.is_dir():
+            cookie_file = self._cookie_from_dir(path, src)
+            if cookie_file:
+                return ['--cookies', str(cookie_file)]
         return []
 
 
@@ -1069,6 +1119,7 @@ class RetroBar(QWidget):
 # ── Task row ──────────────────────────────────────────────
 STEP_LABEL = {
     "queued":            "排队中",
+    "paused":            "已暂停",
     "fetching_subtitles":"获取字幕",
     "downloading":       "下载中",
     "extracting_audio":  "提取音频",
@@ -1083,18 +1134,21 @@ STEP_LABEL = {
 STATUS_LABEL = {
     "queued":     "排队中",
     "processing": "处理中",
+    "paused":     "已暂停",
     "complete":   "完成",
     "error":      "错误",
 }
 
 class TaskRow(QWidget):
-    def __init__(self, task, on_remove=None, on_retry=None, on_open=None, parent=None):
+    def __init__(self, task, on_remove=None, on_retry=None, on_open=None,
+                 on_pause=None, on_resume=None, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         status = task.get("status", "queued")
         color_map = {"queued": C_DIM, "processing": C_PRIMARY,
-                     "complete": C_SUCCESS, "error": C_ERROR}
-        icon_map  = {"queued": "◈", "processing": "▶", "complete": "✓", "error": "✕"}
+                     "paused": C_BRIGHT, "complete": C_SUCCESS, "error": C_ERROR}
+        icon_map  = {"queued": "◈", "processing": "▶", "paused": "Ⅱ",
+                     "complete": "✓", "error": "✕"}
         c  = color_map.get(status, C_DIM)
         ic = icon_map.get(status, "◈")
 
@@ -1140,15 +1194,40 @@ class TaskRow(QWidget):
                 r1.addWidget(rm_btn)
         elif status == "processing":
             tid = task.get("id")
+            if on_pause:
+                pause_btn = _retro_btn("Ⅱ", C_BRIGHT)
+                pause_btn.setFixedWidth(22)
+                pause_btn.setToolTip("暂停")
+                pause_btn.clicked.connect(lambda checked=False, i=tid: on_pause(i))
+                r1.addWidget(pause_btn)
             if on_remove:
                 rm_btn = _retro_btn("×", C_ERROR)
+                rm_btn.setFixedWidth(22)
+                rm_btn.clicked.connect(lambda checked=False, i=tid: on_remove(i))
+                r1.addWidget(rm_btn)
+        elif status in ("queued", "paused"):
+            tid = task.get("id")
+            if status == "queued" and on_pause:
+                pause_btn = _retro_btn("Ⅱ", C_BRIGHT)
+                pause_btn.setFixedWidth(22)
+                pause_btn.setToolTip("暂停排队")
+                pause_btn.clicked.connect(lambda checked=False, i=tid: on_pause(i))
+                r1.addWidget(pause_btn)
+            elif status == "paused" and on_resume:
+                resume_btn = _retro_btn("▶", C_SUCCESS)
+                resume_btn.setFixedWidth(22)
+                resume_btn.setToolTip("继续")
+                resume_btn.clicked.connect(lambda checked=False, i=tid: on_resume(i))
+                r1.addWidget(resume_btn)
+            if on_remove:
+                rm_btn = _retro_btn("×", C_DIM)
                 rm_btn.setFixedWidth(22)
                 rm_btn.clicked.connect(lambda checked=False, i=tid: on_remove(i))
                 r1.addWidget(rm_btn)
 
         lay.addLayout(r1)
 
-        if status in ("processing", "complete", "error"):
+        if status in ("processing", "paused", "complete", "error"):
             r2 = QHBoxLayout(); r2.setSpacing(8)
             pv = task.get("progress", 0.0)
             pb = RetroBar(
@@ -1556,6 +1635,7 @@ class MainWindow(QMainWindow):
         self._queue_lock = threading.Lock()
         self._pending_jobs: list[dict] = []
         self._active_jobs: set[str] = set()
+        self._paused_jobs: set[str] = set()
 
         self._sounds = SoundPlayer(self)
 
@@ -1864,7 +1944,7 @@ class MainWindow(QMainWindow):
         out_dir = self._output_panel.current_path()
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        extra_ydl: list[str] = self._cookies_panel.cookies_args()
+        extra_ydl: list[str] = self._cookies_panel.cookies_args(src)
         screenshot_frequency = self._screenshot_frequency()
         task_id = str(uuid.uuid4())[:8]
         task = {
@@ -1905,7 +1985,14 @@ class MainWindow(QMainWindow):
             with self._queue_lock:
                 if len(self._active_jobs) >= self._max_tasks() or not self._pending_jobs:
                     return
-                job = self._pending_jobs.pop(0)
+                job_idx = next(
+                    (i for i, pending in enumerate(self._pending_jobs)
+                     if pending.get('id') not in self._paused_jobs),
+                    None,
+                )
+                if job_idx is None:
+                    return
+                job = self._pending_jobs.pop(job_idx)
                 self._active_jobs.add(job['id'])
 
             self._mark_dispatched(job['id'])
@@ -1932,6 +2019,7 @@ class MainWindow(QMainWindow):
         finally:
             with self._queue_lock:
                 self._active_jobs.discard(task_id)
+            self._dispatch_pending()
 
     # ── Startup cleanup ───────────────────────────────────
     def _clear_status_file(self):
@@ -1944,16 +2032,76 @@ class MainWindow(QMainWindow):
             pass
 
     # ── Task management ───────────────────────────────────
+    def _set_task_status(self, task_id: str, **fields):
+        tasks = self._read_tasks()
+        changed = False
+        for task in tasks:
+            if task.get('id') == task_id:
+                task.update(fields)
+                changed = True
+                break
+        if changed:
+            self._write_tasks(tasks)
+            self._last_sig = None
+        return changed
+
+    def _append_task_log(self, task_id: str, line: str):
+        tasks = self._read_tasks()
+        changed = False
+        for task in tasks:
+            if task.get('id') == task_id:
+                log = task.setdefault('log', [])
+                log.append(line)
+                task['log'] = log[-120:]
+                changed = True
+                break
+        if changed:
+            self._write_tasks(tasks)
+            self._last_sig = None
+
+    def _pause_task(self, task_id: str):
+        tasks = self._read_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return
+        status = task.get('status')
+        if status == 'queued':
+            with self._queue_lock:
+                self._paused_jobs.add(task_id)
+            self._append_task_log(task_id, "[暂停] 排队已暂停")
+            self._set_task_status(task_id, status='paused', step='paused',
+                                  step_label='[暂停] 排队已暂停')
+            return
+        if status == 'processing' and video2md.pause_task(task_id):
+            self._last_sig = None
+
+    def _resume_task(self, task_id: str):
+        tasks = self._read_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return
+        if task_id in self._active_jobs:
+            if video2md.resume_task(task_id):
+                self._last_sig = None
+            return
+        with self._queue_lock:
+            self._paused_jobs.discard(task_id)
+        self._append_task_log(task_id, "[暂停] 排队已继续")
+        self._set_task_status(task_id, status='queued', step='queued',
+                              step_label='', progress=0.0)
+        self._dispatch_pending()
+
     def _remove_task(self, task_id: str):
         with self._queue_lock:
             self._pending_jobs = [j for j in self._pending_jobs if j.get('id') != task_id]
+            self._paused_jobs.discard(task_id)
         if not STATUS_FILE.exists():
             return
         try:
             data = json.loads(STATUS_FILE.read_text(encoding='utf-8'))
             task = next((t for t in data.get('tasks', []) if t.get('id') == task_id), None)
 
-            if task and task.get('status') == 'processing':
+            if task and task.get('status') in ('processing', 'paused'):
                 video2md.cancel_task(task_id)
                 asset_dir = task.get('pending_asset_dir')
                 output_md = task.get('pending_output_md')
@@ -2096,14 +2244,21 @@ class MainWindow(QMainWindow):
         self._update_stats(tasks)
 
         active = any(t.get("status") == "processing" for t in tasks)
-        sc = C_PRIMARY if active else C_DIM
-        self._op_status.setText("状态: 运行中" if active else "状态: 待机")
+        paused = any(t.get("status") == "paused" for t in tasks)
+        sc = C_PRIMARY if active else (C_BRIGHT if paused else C_DIM)
+        self._op_status.setText("状态: 运行中" if active else ("状态: 已暂停" if paused else "状态: 待机"))
         self._op_status.setStyleSheet(f"color:{_css(sc)}; background:transparent;")
         self._op_status.setGraphicsEffect(_glow(sc, 7))
 
         if hasattr(self, '_tray'):
             n_proc = sum(1 for t in tasks if t.get('status') == 'processing')
-            tip = f"视频摄入队列 — {n_proc} 处理中" if n_proc else "视频摄入队列 — 待机"
+            n_pause = sum(1 for t in tasks if t.get('status') == 'paused')
+            if n_proc:
+                tip = f"视频摄入队列 — {n_proc} 处理中"
+            elif n_pause:
+                tip = f"视频摄入队列 — {n_pause} 已暂停"
+            else:
+                tip = "视频摄入队列 — 待机"
             self._tray.setToolTip(tip)
 
     def _rebuild_queue(self, tasks):
@@ -2120,7 +2275,9 @@ class MainWindow(QMainWindow):
                     i, TaskRow(t,
                                on_remove=self._remove_task,
                                on_retry=self._retry,
-                               on_open=self._open_task))
+                               on_open=self._open_task,
+                               on_pause=self._pause_task,
+                               on_resume=self._resume_task))
 
     def _update_log(self, tasks):
         target = next((t for t in tasks if t.get("status") == "processing"), None)
@@ -2136,11 +2293,11 @@ class MainWindow(QMainWindow):
         sb = self._log.verticalScrollBar(); sb.setValue(sb.maximum())
 
     def _update_stats(self, tasks):
-        counts = {k: 0 for k in ("processing","queued","complete","error")}
+        counts = {k: 0 for k in ("processing","paused","queued","complete","error")}
         for t in tasks:
             s = t.get("status","queued")
             if s in counts: counts[s] += 1
-        txt = (f"处理中: {counts['processing']}   排队: {counts['queued']}   "
+        txt = (f"处理中: {counts['processing']}   暂停: {counts['paused']}   排队: {counts['queued']}   "
                f"完成: {counts['complete']}   错误: {counts['error']}")
         c = C_PRIMARY if counts["processing"] > 0 else C_DIM
         self._stats_lbl.setText(txt)

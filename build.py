@@ -56,6 +56,7 @@ def main():
         '--add-data',      str(ASSETS_DIR / 'Karby.gif')       + ';assets',
         '--collect-all',   'faster_whisper',
         '--collect-all',   'yt_dlp',
+        '--collect-all',   'yt_dlp_ejs',
         '--collect-all',   'ctranslate2',
         '--collect-all',   'tokenizers',
         '--copy-metadata', 'faster-whisper',

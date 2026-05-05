@@ -10,6 +10,7 @@ portable 版改动：
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ _BILI_RE = re.compile(r'bilibili\.com|b23\.tv', re.I)
 _YT_RE   = re.compile(r'youtube\.com|youtu\.be', re.I)
 
 _cancel_events: dict  = {}   # task_id -> threading.Event
+_pause_events: dict   = {}   # task_id -> threading.Event (set means paused)
 _status_writers: dict = {}   # task_id -> StatusWriter
 _status_lock = threading.Lock()
 
@@ -63,9 +65,49 @@ def _apply_bili_headers(opts: dict, url: str) -> None:
         h['Origin']     = 'https://www.bilibili.com'
         h.setdefault('User-Agent', _BILI_UA)
 
+
+def _apply_youtube_js_runtime(opts: dict, url: str) -> None:
+    """YouTube needs a JS runtime plus yt-dlp-ejs to solve n challenges."""
+    if not _YT_RE.search(url):
+        return
+    if not shutil.which('node'):
+        return
+    runtimes = opts.setdefault('js_runtimes', {})
+    if isinstance(runtimes, dict):
+        runtimes.setdefault('node', {})
+
+
+def _apply_download_resilience(opts: dict, url: str) -> None:
+    """Make long media transfers more tolerant of transient stream failures."""
+    opts.setdefault('continuedl', True)
+    opts.setdefault('retries', 15)
+    opts.setdefault('fragment_retries', 25)
+    opts.setdefault('file_access_retries', 5)
+    opts.setdefault('extractor_retries', 5)
+    opts.setdefault('socket_timeout', 30)
+    if _YT_RE.search(url):
+        # Smaller ranged HTTP chunks resume more cleanly when YouTube closes a stream early.
+        opts.setdefault('http_chunk_size', 10 * 1024 * 1024)
+
+
+def _subtitle_langs(url: str) -> list[str]:
+    if _YT_RE.search(url):
+        return [
+            'en',
+            'en-orig',
+            '-live_chat',
+        ]
+    return ['all', '-live_chat']
+
 _YT_BOT_RE     = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
 _BILI_AUTH_RE  = re.compile(r'login|大会员|需要登录|请先登录|仅限|premium|vip', re.I)
 _COOKIE_ERR_RE = re.compile(r'cookie|keyring|could not copy|permission denied|dpapi|decrypt', re.I)
+_NET_RE        = re.compile(
+    r'bytes read,\s*\d+\s*more expected|timed?\s*out|connection (?:reset|aborted)|'
+    r'broken pipe|temporarily unavailable|remote end closed|incomplete read|'
+    r'http error 5\d\d|server error',
+    re.I,
+)
 
 
 def _running_browsers() -> set[str]:
@@ -93,6 +135,45 @@ def _browser_cookie_chain(base_opts: dict) -> list[tuple[dict, str]]:
             for b in browsers]
 
 
+def _has_cookie_opts(opts: dict) -> bool:
+    return bool(opts.get('cookiefile') or opts.get('cookiesfrombrowser'))
+
+
+def _cached_cookie_file(domain: str) -> 'Path | None':
+    cached = _cache_dir() / f'cookies_{domain.replace(".", "_")}.txt'
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+    return None
+
+
+def _cookie_file_chain(base_opts: dict, domain: str, label: str,
+                       refresh: bool = False) -> list[tuple[dict, str]]:
+    if _has_cookie_opts(base_opts):
+        return []
+    cookie_file = _cached_cookie_file(domain)
+    if not cookie_file and refresh:
+        cookie_file = _extract_edge_cookies_to_file(domain)
+    if not cookie_file:
+        return []
+    return [({**base_opts, 'cookiefile': str(cookie_file)}, label)]
+
+
+def _normalized_user_cookie_chain(base_opts: dict) -> list[tuple[dict, str]]:
+    cookie_file = base_opts.get('cookiefile')
+    if not cookie_file:
+        return []
+    normalized = _normalize_cookie_file(str(cookie_file))
+    if normalized == cookie_file:
+        return []
+    return [({**base_opts, 'cookiefile': normalized}, '规范化Cookie')]
+
+
+def _cookie_domain_needles(domain: str) -> list[str]:
+    if domain == 'youtube.com':
+        return ['youtube', 'google']
+    return [domain.split('.')[0]]
+
+
 def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]]:
     """
     字幕提取专用重试链（少即是多，避免触发 429）：
@@ -106,13 +187,20 @@ def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
     if is_yt:
         mobile = {**base_opts,
                   'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}}
-        return [(mobile, '移动端'), (base_opts, '默认')]
+        normalized_cookie_chain = _normalized_user_cookie_chain(base_opts)
+        if normalized_cookie_chain:
+            return [(base_opts, '默认'), (mobile, '移动端')] + normalized_cookie_chain
+        yt_cookie_chain = _cookie_file_chain(base_opts, 'youtube.com', 'Edge YouTube Cookie')
+        if yt_cookie_chain:
+            return yt_cookie_chain + [(base_opts, '默认'), (mobile, '移动端')]
+        return [(base_opts, '默认'), (mobile, '移动端')]
 
     if is_bili:
         chain = []
         bili_cookies = get_bili_cookies_file()
         if bili_cookies:
             chain.append(({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
+        chain += _normalized_user_cookie_chain(base_opts)
         chain += _browser_cookie_chain(base_opts)
         chain.append((base_opts, '默认'))
         return chain
@@ -138,6 +226,15 @@ def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
         bili_cookies = get_bili_cookies_file()
         if bili_cookies:
             chain.insert(0, ({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
+
+    chain += _normalized_user_cookie_chain(base_opts)
+
+    if is_yt:
+        yt_cookie_chain = _cookie_file_chain(base_opts, 'youtube.com', 'Edge YouTube Cookie')
+        if yt_cookie_chain:
+            chain = yt_cookie_chain + chain
+        else:
+            chain += _cookie_file_chain(base_opts, 'youtube.com', 'Edge YouTube Cookie', refresh=True)
 
     chain += _browser_cookie_chain(base_opts)
 
@@ -190,6 +287,77 @@ def _ffmpeg_bin(name: str) -> str:
         if p2.exists():
             return str(p2)
     return name
+
+
+def _decode_cookie_text(raw: bytes) -> str:
+    for enc in ('utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be'):
+        try:
+            text = raw.decode(enc)
+            if '\x00' not in text[:100]:
+                return text
+        except UnicodeDecodeError:
+            pass
+    return raw.decode('utf-8', errors='replace')
+
+
+def _json_cookie_to_netscape_line(cookie: dict) -> str | None:
+    domain = cookie.get('domain') or cookie.get('host') or cookie.get('host_key')
+    name = cookie.get('name')
+    value = cookie.get('value', '')
+    if not domain or not name:
+        return None
+    path = cookie.get('path') or '/'
+    secure = 'TRUE' if cookie.get('secure') else 'FALSE'
+    include_subdomains = 'TRUE' if str(domain).startswith('.') else 'FALSE'
+    expires = cookie.get('expirationDate', cookie.get('expires', cookie.get('expires_at', 0)))
+    try:
+        expires_s = str(int(float(expires or 0)))
+    except (TypeError, ValueError):
+        expires_s = '0'
+    if cookie.get('httpOnly') or cookie.get('http_only'):
+        domain = '#HttpOnly_' + str(domain)
+    return '\t'.join([str(domain), include_subdomains, str(path), secure, expires_s,
+                      str(name), str(value)])
+
+
+def _normalize_cookie_file(cookie_path: str) -> str:
+    """Rewrite user-selected cookies into a conservative Netscape file for yt-dlp."""
+    src = Path(cookie_path).expanduser()
+    if not src.exists():
+        return cookie_path
+    try:
+        text = _decode_cookie_text(src.read_bytes()).replace('\r\n', '\n').replace('\r', '\n')
+        lines: list[str] = ['# Netscape HTTP Cookie File']
+        stripped = text.lstrip()
+        if stripped.startswith(('[', '{')):
+            data = json.loads(stripped)
+            cookies = data.get('cookies', data) if isinstance(data, dict) else data
+            for cookie in cookies if isinstance(cookies, list) else []:
+                if isinstance(cookie, dict):
+                    line = _json_cookie_to_netscape_line(cookie)
+                    if line:
+                        lines.append(line)
+        else:
+            for raw_line in text.split('\n'):
+                line = raw_line.strip('\ufeff')
+                if not line:
+                    continue
+                if line.startswith('#HttpOnly_'):
+                    fields = line.split('\t')
+                elif line.startswith('#'):
+                    continue
+                else:
+                    fields = line.split('\t')
+                if len(fields) == 7:
+                    lines.append('\t'.join(fields))
+        if len(lines) == 1:
+            return cookie_path
+        digest = hashlib.sha1(str(src.resolve()).encode('utf-8', errors='replace')).hexdigest()[:12]
+        out_path = _cache_dir() / f'user_cookies_{digest}.txt'
+        out_path.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+        return str(out_path)
+    except Exception:
+        return cookie_path
 
 
 # ─────────────────────────── 浏览器 Cookie 自动提取 ──────────────
@@ -328,8 +496,9 @@ def _cdp_extract_cookies(domain: str) -> 'Path | None':
             return None
 
         all_cookies  = _cdp_get_all_cookies(page_ws)
+        needles = _cookie_domain_needles(domain)
         bili_cookies = [c for c in all_cookies
-                        if domain.split('.')[0] in c.get('domain', '')]
+                        if any(n in c.get('domain', '') for n in needles)]
         if not bili_cookies:
             return None
 
@@ -377,10 +546,13 @@ def _aesgcm_extract_cookies(domain: str) -> 'Path | None':
             cookie_db = edge_base / 'Cookies'
         if not cookie_db.exists():
             return None
+        needles = _cookie_domain_needles(domain)
+        where = ' OR '.join(['host_key LIKE ?'] * len(needles))
+        params = tuple(f'%{n}%' for n in needles)
         with _sq.connect(str(cookie_db), timeout=0.3) as conn:
             rows = conn.execute(
                 'SELECT host_key, name, path, encrypted_value, expires_utc, is_secure '
-                'FROM cookies WHERE host_key LIKE ?', (f'%{domain}%',)
+                f'FROM cookies WHERE {where}', params
             ).fetchall()
         if not rows:
             return None
@@ -422,6 +594,11 @@ def refresh_bili_cookies() -> 'Path | None':
     return _extract_edge_cookies_to_file('bilibili.com')
 
 
+def refresh_youtube_cookies() -> 'Path | None':
+    """供外部调用：尝试刷新 YouTube Cookie 缓存，返回 cookies.txt 路径。"""
+    return _extract_edge_cookies_to_file('youtube.com')
+
+
 def get_bili_cookies_file() -> 'Path | None':
     """返回可用的 B站 cookies.txt（仅读缓存，不触发提取）。"""
     cached = _cache_dir() / 'cookies_bilibili_com.txt'
@@ -430,16 +607,46 @@ def get_bili_cookies_file() -> 'Path | None':
     return None
 
 
+def get_youtube_cookies_file() -> 'Path | None':
+    """返回可用的 YouTube cookies.txt（仅读缓存，不触发提取）。"""
+    return _cached_cookie_file('youtube.com')
+
+
 def cancel_task(task_id: str) -> bool:
     """取消正在处理的任务：标记 StatusWriter 不再写入，并设置 cancel 事件。"""
     sw = _status_writers.get(task_id)
     if sw:
         sw.cancelled = True
+    pause_ev = _pause_events.get(task_id)
+    if pause_ev:
+        pause_ev.clear()
     ev = _cancel_events.get(task_id)
     if ev:
         ev.set()
         return True
     return False
+
+
+def pause_task(task_id: str) -> bool:
+    """暂停正在处理的任务。"""
+    pause_ev = _pause_events.get(task_id)
+    sw = _status_writers.get(task_id)
+    if not pause_ev or not sw:
+        return False
+    pause_ev.set()
+    sw.pause()
+    return True
+
+
+def resume_task(task_id: str) -> bool:
+    """恢复正在处理的任务。"""
+    pause_ev = _pause_events.get(task_id)
+    sw = _status_writers.get(task_id)
+    if not pause_ev or not sw:
+        return False
+    pause_ev.clear()
+    sw.resume()
+    return True
 
 
 # ─────────────────────────── 状态写入 ────────────────────────────
@@ -468,7 +675,50 @@ class StatusWriter:
         }
         self._flush()
 
+    def pause(self):
+        if self._data.get("status") == "paused":
+            return
+        self._data["_resume_status"] = self._data.get("status", "processing")
+        self._data["status"] = "paused"
+        self._data["step_label"] = "[暂停] 已暂停"
+        self.log("[暂停] 已暂停")
+
+    def resume(self):
+        if self._data.get("status") != "paused":
+            return
+        resume_status = self._data.pop("_resume_status", "processing")
+        self._data["status"] = resume_status if resume_status != "paused" else "processing"
+        if "_resume_step" in self._data:
+            self._data["step"] = self._data.pop("_resume_step")
+        if "_resume_label" in self._data:
+            self._data["step_label"] = self._data.pop("_resume_label")
+        if "_resume_progress" in self._data:
+            self._data["progress"] = self._data.pop("_resume_progress")
+        self.log("[暂停] 已继续")
+        self._flush()
+
+    def wait_if_paused(self, cancel_ev: 'threading.Event | None' = None):
+        pause_ev = _pause_events.get(self.task_id)
+        if not pause_ev:
+            return
+        logged = False
+        while pause_ev.is_set():
+            if cancel_ev and cancel_ev.is_set():
+                return
+            if not logged:
+                self.pause()
+                logged = True
+            time.sleep(0.2)
+        if logged:
+            self.resume()
+
     def update(self, step: str, label: str, progress: float):
+        if self._data.get("status") == "paused":
+            self._data["_resume_step"] = step
+            self._data["_resume_label"] = label
+            self._data["_resume_progress"] = min(progress, 0.99)
+            return
+        self._data["status"] = "processing"
         self._data.update(step=step, step_label=label, progress=min(progress, 0.99))
         self._flush()
 
@@ -560,6 +810,7 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         _apply_bili_headers(opts, src)
+    _apply_youtube_js_runtime(opts, src)
     for attempt_opts, label in _platform_fallback_chain(opts, src):
         try:
             run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
@@ -591,12 +842,15 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         _apply_bili_headers(opts, url)
+    _apply_youtube_js_runtime(opts, url)
+    _apply_download_resilience(opts, url)
     opts.update({
         'writesubtitles': True,
         'writeautomaticsub': True,
-        'subtitleslangs': ['all', '-live_chat'],  # 不过滤语言码，防止 ai-zh 等被漏掉
+        'subtitleslangs': _subtitle_langs(url),
         'subtitlesformat': 'vtt/srt/best',
         'skip_download': True,
+        'format': 'best',
         'outtmpl': str(sub_dir / '%(title)s'),
     })
 
@@ -626,7 +880,7 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
 
     for attempt_opts, label in _subtitle_fallback_chain(opts, url):
         try:
-            run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
+            run_opts = {**attempt_opts, 'logger': _SilentLogger()}
             with yt_dlp.YoutubeDL(run_opts) as ydl:
                 ydl.download([url])
             # 无异常，但要确认文件真的生成了
@@ -726,6 +980,8 @@ def download_video(url: str, work_dir: Path, status=None,
     out_tmpl = str(work_dir / 'video.%(ext)s')
 
     def _hook(d: dict):
+        if status:
+            status.wait_if_paused(_cancel_events.get(status.task_id))
         if d['status'] == 'downloading' and status:
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 1
             pct = d.get('downloaded_bytes', 0) / total
@@ -741,6 +997,8 @@ def download_video(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         _apply_bili_headers(opts, url)
+    _apply_youtube_js_runtime(opts, url)
+    _apply_download_resilience(opts, url)
     opts.update({
         'format': (
             'bestvideo[height<=1080]+bestaudio/'
@@ -755,25 +1013,41 @@ def download_video(url: str, work_dir: Path, status=None,
 
     last_err = None
     for attempt_opts, label in _platform_fallback_chain(opts, url):
-        try:
-            run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
-            with yt_dlp.YoutubeDL(run_opts) as ydl:
-                ydl.download([url])
-            last_err = None
+        for net_attempt in range(1, 4):
+            try:
+                run_opts = {**attempt_opts, 'logger': _SilentLogger()} if 'Cookie' in label else attempt_opts
+                with yt_dlp.YoutubeDL(run_opts) as ydl:
+                    ydl.download([url])
+                last_err = None
+                break
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                s = str(e)
+                is_browser = 'Cookie' in label
+                is_auth_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
+                is_net_retryable = bool(_NET_RE.search(s))
+                if is_net_retryable and net_attempt < 3:
+                    if status:
+                        status.log(f"  [下载] 网络中断，自动续传重试 {net_attempt}/2...")
+                    continue
+                if is_browser or is_auth_retryable:
+                    if label != '默认' and status:
+                        status.log(f"  [下载] {label} 失败，继续尝试...")
+                    break
+                break  # 非 bot/cookie/网络 错误，不重试
+        if last_err is None:
             break
-        except yt_dlp.utils.DownloadError as e:
-            last_err = e
-            s = str(e)
-            is_browser = 'Cookie' in label
-            is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
-            if is_browser or is_retryable:
-                if label != '默认' and status:
-                    status.log(f"  [下载] {label} 失败，继续尝试...")
-                continue
-            break  # 非 bot/cookie 错误，不重试
+        if _NET_RE.search(str(last_err)):
+            break
 
     if last_err:
         err = str(last_err)
+        if _YT_RE.search(url) and _YT_BOT_RE.search(err):
+            err += (
+                "\n\nYouTube needs logged-in cookies for this request. "
+                "Log in to YouTube in Edge/Chrome, close the browser so cookies can be read, "
+                "or export a Netscape cookies.txt and select it in the Cookie field."
+            )
         if status:
             for line in err.splitlines()[-8:]:
                 if line.strip():
@@ -819,6 +1093,8 @@ def transcribe(audio_path: Path, model_size: str, lang: str | None,
     total_dur = info.duration or 1.0
     segs = []
     for s in segs_iter:
+        if status:
+            status.wait_if_paused(_cancel_events.get(status.task_id))
         segs.append((s.start, s.end, s.text.strip()))
         if status:
             prog = 0.10 + 0.65 * min(s.end / total_dur, 1.0)
@@ -988,15 +1264,19 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     sw = StatusWriter(task_id or str(uuid.uuid4())[:8], initial_title, src)
     # 注册取消机制，先于网络探测，保证 GUI 中刚启动的任务也能取消。
     cancel_ev = threading.Event()
+    pause_ev = threading.Event()
     _cancel_events[sw.task_id] = cancel_ev
+    _pause_events[sw.task_id] = pause_ev
     _status_writers[sw.task_id] = sw
 
     try:
+        sw.wait_if_paused(cancel_ev)
         threshold = screenshot_threshold(screenshot_frequency, threshold)
         title, duration = get_video_info(src, extra_ydl)
     except Exception as exc:
         sw.error(str(exc))
         _cancel_events.pop(sw.task_id, None)
+        _pause_events.pop(sw.task_id, None)
         _status_writers.pop(sw.task_id, None)
         raise
     sw._data['title'] = title
@@ -1027,11 +1307,13 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
             segments = None
             video_path = Path(src) if is_local else None
 
+            sw.wait_if_paused(cancel_ev)
             if not is_local:
                 sw.update("fetching_subtitles", "[字幕] 尝试平台字幕...", 0.02)
                 sw.log("[字幕] 尝试平台字幕...")
                 segments = try_platform_subtitles(src, work, status=sw, extra_args=extra_ydl)
 
+            sw.wait_if_paused(cancel_ev)
             if cancel_ev.is_set():
                 raise RuntimeError('cancelled')
 
@@ -1042,6 +1324,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
                 sw.log("[下载] 下载视频（最高 1080p）...")
                 video_path = download_video(src, work, status=sw, extra_args=extra_ydl)
 
+            sw.wait_if_paused(cancel_ev)
             if cancel_ev.is_set():
                 raise RuntimeError('cancelled')
 
@@ -1057,9 +1340,11 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
                 print(f"[字幕] 加载缓存：{len(segments)} 段", flush=True)
 
             if segments is None:
+                sw.wait_if_paused(cancel_ev)
                 sw.update("extracting_audio", "[音频] 提取音轨...", 0.08)
                 sw.log("[音频] 提取音轨...")
                 audio = extract_audio(video_path, work)
+                sw.wait_if_paused(cancel_ev)
                 segments = transcribe(audio, model, lang, status=sw)
                 out_md.parent.mkdir(parents=True, exist_ok=True)
                 seg_cache.write_text(json.dumps(segments, ensure_ascii=False), encoding='utf-8')
@@ -1070,10 +1355,12 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
             if cancel_ev.is_set():
                 raise RuntimeError('cancelled')
 
+            sw.wait_if_paused(cancel_ev)
             sw.update("extracting_frames", "[截图] 场景检测关键帧...", 0.76)
             sw.log(f"[截图] 场景检测关键帧（阈值={threshold}）...")
             asset_dir.mkdir(parents=True, exist_ok=True)
             frames = extract_keyframes(video_path or Path(src), asset_dir, threshold)
+            sw.wait_if_paused(cancel_ev)
             sw.log(f"  → {len(frames)} 帧")
             sw.update("building_md", "[合成] 生成 Markdown...", 0.92)
             sw.log("[合成] 生成 Markdown...")
@@ -1095,6 +1382,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
         raise
     finally:
         _cancel_events.pop(sw.task_id, None)
+        _pause_events.pop(sw.task_id, None)
         _status_writers.pop(sw.task_id, None)
 
     sw.complete(len(frames), len(segments) if segments else 0, str(out_md))
