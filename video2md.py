@@ -11,6 +11,7 @@ portable 版改动：
 
 import argparse
 import hashlib
+import http.cookiejar
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -66,6 +68,27 @@ def _apply_bili_headers(opts: dict, url: str) -> None:
         h.setdefault('User-Agent', _BILI_UA)
 
 
+def _bili_cookie_login_state(cookiefile: str | None) -> str:
+    if not cookiefile:
+        return '未提供'
+    path = Path(cookiefile)
+    if not path.exists():
+        return '文件不存在'
+    try:
+        jar = http.cookiejar.MozillaCookieJar(str(path))
+        jar.load(ignore_discard=True, ignore_expires=True)
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        req = urllib.request.Request(
+            'https://api.bilibili.com/x/web-interface/nav',
+            headers={'User-Agent': _BILI_UA, 'Referer': 'https://www.bilibili.com/'},
+        )
+        data = json.load(opener.open(req, timeout=10))
+        info = data.get('data') or {}
+        return '已登录' if info.get('isLogin') else f"未登录({data.get('code')})"
+    except Exception:
+        return '未知'
+
+
 def _apply_youtube_js_runtime(opts: dict, url: str) -> None:
     """YouTube needs a JS runtime plus yt-dlp-ejs to solve n challenges."""
     if not _YT_RE.search(url):
@@ -98,6 +121,16 @@ def _subtitle_langs(url: str) -> list[str]:
             '-live_chat',
         ]
     return ['all', '-live_chat']
+
+
+def _apply_subtitle_format_workaround(opts: dict, url: str) -> None:
+    """Avoid video format selection blocking subtitle-only extraction."""
+    opts['ignore_no_formats_error'] = True
+    if _YT_RE.search(url):
+        # YouTube subtitle extraction can otherwise fail during player selection.
+        opts['format'] = 'best'
+    else:
+        opts.pop('format', None)
 
 _YT_BOT_RE     = re.compile(r'Sign in to confirm|bot|confirm you.re not', re.I)
 _BILI_AUTH_RE  = re.compile(r'login|大会员|需要登录|请先登录|仅限|premium|vip', re.I)
@@ -196,13 +229,13 @@ def _subtitle_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
         return [(base_opts, '默认'), (mobile, '移动端')]
 
     if is_bili:
-        chain = []
-        bili_cookies = get_bili_cookies_file()
-        if bili_cookies:
-            chain.append(({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
+        chain = [(base_opts, '用户Cookie' if _has_cookie_opts(base_opts) else '默认')]
         chain += _normalized_user_cookie_chain(base_opts)
-        chain += _browser_cookie_chain(base_opts)
-        chain.append((base_opts, '默认'))
+        if not _has_cookie_opts(base_opts):
+            bili_cookies = get_bili_cookies_file()
+            if bili_cookies:
+                chain.insert(0, ({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
+            chain += _browser_cookie_chain(base_opts)
         return chain
 
     return [(base_opts, '默认')]
@@ -222,7 +255,7 @@ def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
     if not (is_yt or is_bili):
         return chain
 
-    if is_bili:
+    if is_bili and not _has_cookie_opts(base_opts):
         bili_cookies = get_bili_cookies_file()
         if bili_cookies:
             chain.insert(0, ({**base_opts, 'cookiefile': str(bili_cookies)}, 'Edge本地Cookie'))
@@ -236,7 +269,8 @@ def _platform_fallback_chain(base_opts: dict, url: str) -> list[tuple[dict, str]
         else:
             chain += _cookie_file_chain(base_opts, 'youtube.com', 'Edge YouTube Cookie', refresh=True)
 
-    chain += _browser_cookie_chain(base_opts)
+    if not _has_cookie_opts(base_opts):
+        chain += _browser_cookie_chain(base_opts)
 
     if is_yt:
         chain.append(({**base_opts,
@@ -850,24 +884,27 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         'subtitleslangs': _subtitle_langs(url),
         'subtitlesformat': 'vtt/srt/best',
         'skip_download': True,
-        'format': 'best',
         'outtmpl': str(sub_dir / '%(title)s'),
     })
+    _apply_subtitle_format_workaround(opts, url)
 
     # B站诊断：先 extract_info 列出可用字幕语言（print 到 stdout，不受 UI 30 行限制）
     if _BILI_RE.search(url):
         try:
             diag_opts = {**opts, 'writesubtitles': False, 'writeautomaticsub': False,
                          'logger': _SilentLogger()}
+            _apply_subtitle_format_workaround(diag_opts, url)
             bili_ck = get_bili_cookies_file()
-            cookie_note = f'cookie={bili_ck.name}' if bili_ck else 'cookie=无'
             if bili_ck:
                 diag_opts['cookiefile'] = str(bili_ck)
+            cookiefile = diag_opts.get('cookiefile')
+            cookie_note = f"cookie={Path(cookiefile).name}" if cookiefile else 'cookie=无'
+            login_note = _bili_cookie_login_state(cookiefile)
             with yt_dlp.YoutubeDL(diag_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             subs = list((info or {}).get('subtitles', {}).keys())
             auto = list((info or {}).get('automatic_captions', {}).keys())
-            msg = (f"[字幕诊断] {cookie_note} | 字幕: {subs} | 自动字幕: {auto}"
+            msg = (f"[字幕诊断] {cookie_note} | 登录态: {login_note} | 字幕: {subs} | 自动字幕: {auto}"
                    + ('' if (subs or auto) else ' ← 均为空'))
             print(msg, flush=True)
             if status:
