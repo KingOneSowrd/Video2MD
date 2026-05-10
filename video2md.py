@@ -11,8 +11,10 @@ portable 版改动：
 
 import argparse
 import hashlib
+import html
 import http.cookiejar
 import json
+import math
 import os
 import re
 import shutil
@@ -21,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta
@@ -32,6 +35,8 @@ STATUS_FILE = Path.home() / '.video2md_status.json'
 
 _BILI_RE = re.compile(r'bilibili\.com|b23\.tv', re.I)
 _YT_RE   = re.compile(r'youtube\.com|youtu\.be', re.I)
+_GDC_RE  = re.compile(r'gdcvault\.com/play/', re.I)
+_GDC_STREAM_RE = re.compile(r'(?:gdcvault\.)?blazestreaming\.com|cdn-[^.]+\.blazestreaming\.com', re.I)
 
 _cancel_events: dict  = {}   # task_id -> threading.Event
 _pause_events: dict   = {}   # task_id -> threading.Event (set means paused)
@@ -66,6 +71,133 @@ def _apply_bili_headers(opts: dict, url: str) -> None:
         h['Referer']    = 'https://www.bilibili.com'
         h['Origin']     = 'https://www.bilibili.com'
         h.setdefault('User-Agent', _BILI_UA)
+
+
+def _apply_gdc_headers(opts: dict, url: str) -> None:
+    """GDC Vault HLS streams expect a browser-like request and player referer."""
+    if not (_GDC_RE.search(url) or _GDC_STREAM_RE.search(url)):
+        return
+    h = opts.setdefault('http_headers', {})
+    h.setdefault('User-Agent', _BILI_UA)
+    if _GDC_STREAM_RE.search(url):
+        h.setdefault('Referer', 'https://gdcvault.blazestreaming.com/')
+
+
+def _fetch_text(url: str, referer: str | None = None, timeout: int = 30) -> str:
+    headers = {'User-Agent': _BILI_UA}
+    if referer:
+        headers['Referer'] = referer
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        charset = resp.headers.get_content_charset() or 'utf-8'
+    return raw.decode(charset, errors='replace')
+
+
+def _find_first_url(pattern: str, text: str, base_url: str | None = None) -> str | None:
+    m = re.search(pattern, text, re.I | re.S)
+    if not m:
+        return None
+    url = html.unescape(m.group(1) if m.groups() else m.group(0))
+    url = url.replace('\\/', '/')
+    return urllib.parse.urljoin(base_url, url) if base_url else url
+
+
+def _extract_gdc_title(page_html: str) -> str | None:
+    for pattern in (
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+        r'<h3[^>]*>\s*Session Name:\s*</h3>\s*([^<]+)',
+        r'<title[^>]*>([^<]+)</title>',
+    ):
+        title = _find_first_url(pattern, page_html)
+        if title:
+            title = re.sub(r'^\s*GDC Vault\s*-\s*', '', title.strip())
+            return html.unescape(title)
+    return None
+
+
+def _resolve_gdc_hls_from_player(iframe_url: str, player_html: str,
+                                 page_html: str = '') -> str | None:
+    hls_url = _find_first_url(
+        r'(https?://[^"\'<>\s]+?\.m3u8(?:\?[^"\'<>\s]*)?)',
+        player_html,
+    ) or _find_first_url(
+        r'(https?://[^"\'<>\s]+?\.m3u8(?:\?[^"\'<>\s]*)?)',
+        page_html,
+    )
+    if hls_url:
+        return hls_url
+
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(iframe_url).query)
+    video_id = (query.get('id') or [None])[0]
+    if not video_id:
+        return None
+
+    script_url = urllib.parse.urljoin(iframe_url, 'script_VOD.js')
+    try:
+        script_js = _fetch_text(script_url, referer=iframe_url)
+        path_match = re.search(
+            r"out/v1/'\s*\+\s*videoId\s*\+\s*'(/[^']+?/index\.m3u8)",
+            script_js,
+            re.I | re.S,
+        )
+        host_match = re.search(
+            r"PLAYBACK_URL\s*=\s*['\"](https?://[^'\"]+/out/v1/)['\"]",
+            script_js,
+            re.I,
+        )
+        if path_match:
+            host = host_match.group(1) if host_match else 'https://cdn-a.blazestreaming.com/out/v1/'
+            return urllib.parse.urljoin(host, video_id + path_match.group(1))
+    except Exception:
+        pass
+
+    return (
+        f'https://cdn-a.blazestreaming.com/out/v1/{video_id}/'
+        '38549d9a185b445888c6fbc2e2e792e9/'
+        '50413c5b8a95441e919f0a1579606e47/index.m3u8'
+    )
+
+
+def resolve_gdcvault_source(src: str, status=None) -> tuple[str, str, str | None]:
+    """
+    Resolve a GDC Vault play page to the underlying HLS playlist.
+
+    Returns (media_url, original_source_url, title_hint). Non-GDC inputs pass through.
+    """
+    if not _GDC_RE.search(src):
+        return src, src, None
+
+    def log(msg: str) -> None:
+        print(msg, flush=True)
+        if status:
+            status.log(msg)
+
+    log("[GDC] Resolving GDC Vault player...")
+    page_html = _fetch_text(src)
+    title_hint = _extract_gdc_title(page_html)
+    iframe_url = _find_first_url(
+        r'(?:src|data-src)=["\']([^"\']*blazestreaming\.com[^"\']*)["\']',
+        page_html,
+        src,
+    ) or _find_first_url(
+        r'(https?://(?:gdcvault\.)?blazestreaming\.com/\?id=[^"\'<>\s]+)',
+        page_html,
+    )
+    if not iframe_url:
+        log("[GDC] No blazestreaming iframe found; falling back to yt-dlp.")
+        return src, src, title_hint
+
+    log(f"[GDC] Player: {iframe_url}")
+    player_html = _fetch_text(iframe_url, referer=src)
+    hls_url = _resolve_gdc_hls_from_player(iframe_url, player_html, page_html)
+    if not hls_url:
+        log("[GDC] No HLS playlist found; falling back to yt-dlp.")
+        return src, src, title_hint
+
+    log(f"[GDC] HLS: {hls_url}")
+    return hls_url, src, title_hint
 
 
 def _bili_cookie_login_state(cookiefile: str | None) -> str:
@@ -844,6 +976,7 @@ def get_video_info(src: str, extra_args: list[str] | None = None) -> tuple[str, 
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(src):
         _apply_bili_headers(opts, src)
+    _apply_gdc_headers(opts, src)
     _apply_youtube_js_runtime(opts, src)
     for attempt_opts, label in _platform_fallback_chain(opts, src):
         try:
@@ -876,6 +1009,7 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         _apply_bili_headers(opts, url)
+    _apply_gdc_headers(opts, url)
     _apply_youtube_js_runtime(opts, url)
     _apply_download_resilience(opts, url)
     opts.update({
@@ -1034,6 +1168,7 @@ def download_video(url: str, work_dir: Path, status=None,
     opts = _ydl_opts_base(extra_args)
     if _BILI_RE.search(url):
         _apply_bili_headers(opts, url)
+    _apply_gdc_headers(opts, url)
     _apply_youtube_js_runtime(opts, url)
     _apply_download_resilience(opts, url)
     opts.update({
@@ -1147,6 +1282,12 @@ SCREENSHOT_FREQUENCY_THRESHOLDS = {
     'High': 0.3,
     'Max': 0.12,
 }
+SCREENSHOT_FREQUENCY_INTERVALS = {
+    'Small': 30,
+    'Medium': 20,
+    'High': 12,
+    'Max': 6,
+}
 DEFAULT_SCREENSHOT_FREQUENCY = 'Small'
 
 
@@ -1158,8 +1299,24 @@ def screenshot_threshold(frequency: str | None = None, threshold: float | None =
     return SCREENSHOT_FREQUENCY_THRESHOLDS[DEFAULT_SCREENSHOT_FREQUENCY]
 
 
+def screenshot_interval(frequency: str | None = None) -> int:
+    if frequency in SCREENSHOT_FREQUENCY_INTERVALS:
+        return SCREENSHOT_FREQUENCY_INTERVALS[frequency]
+    return SCREENSHOT_FREQUENCY_INTERVALS[DEFAULT_SCREENSHOT_FREQUENCY]
+
+
+def _video_duration(video_path: Path) -> float:
+    res = run([_ffmpeg_bin('ffprobe'), '-v', 'quiet', '-show_entries', 'format=duration',
+               '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)], check=False)
+    try:
+        return float(res.stdout.strip()) if res.returncode == 0 else 0.0
+    except ValueError:
+        return 0.0
+
+
 def extract_keyframes(video_path: Path, out_dir: Path,
-                      threshold: float = 0.5):
+                      threshold: float = 0.5,
+                      min_interval: int = 30):
     """
     场景检测关键帧提取。threshold 越小，截图越多。
     """
@@ -1190,26 +1347,44 @@ def extract_keyframes(video_path: Path, out_dir: Path,
                 for i, f in enumerate(files)]
 
     frames = _detect(threshold)
+    duration = _video_duration(video_path)
+    min_expected = max(1, math.ceil(duration / min_interval)) if duration else 1
 
-    # 仍不足则改用间隔截图兜底
-    if not frames:
-        print("  → 无场景变化，改用间隔截图（每30秒）。", flush=True)
-        return _interval_frames(video_path, out_dir)
+    # 慢变化视频会产生少量场景帧但仍明显不够，补间隔帧避免截图被“卡住”。
+    if len(frames) < min_expected:
+        if frames:
+            print(f"  → 场景帧偏少（{len(frames)}/{min_expected}），补间隔截图（每{min_interval}秒）。",
+                  flush=True)
+        else:
+            print(f"  → 无场景变化，改用间隔截图（每{min_interval}秒）。", flush=True)
+        frames = _merge_frame_sets(
+            frames,
+            _interval_frames(video_path, out_dir, interval=min_interval, prefix='frame_interval'),
+        )
 
     print(f"  → {len(frames)} 帧", flush=True)
     return frames
 
 
-def _interval_frames(video_path: Path, out_dir: Path, interval: int = 30):
+def _merge_frame_sets(primary: list, supplement: list, min_gap: float = 1.0) -> list:
+    merged = sorted(primary + supplement, key=lambda item: item[0])
+    result = []
+    for ts, path in merged:
+        if result and abs(ts - result[-1][0]) < min_gap:
+            continue
+        result.append((ts, path))
+    return result
+
+
+def _interval_frames(video_path: Path, out_dir: Path, interval: int = 30,
+                     prefix: str = 'frame'):
     """兜底：每 N 秒截一帧"""
-    res = run([_ffmpeg_bin('ffprobe'), '-v', 'quiet', '-show_entries', 'format=duration',
-               '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)], check=False)
-    duration = float(res.stdout.strip()) if res.returncode == 0 else 0.0
+    duration = _video_duration(video_path)
 
     frames = []
     t, idx = 0.0, 1
     while t < duration:
-        fpath = out_dir / f'frame_{idx:05d}.jpg'
+        fpath = out_dir / f'{prefix}_{idx:05d}.jpg'
         run([_ffmpeg_bin('ffmpeg'), '-ss', str(t), '-i', str(video_path),
              '-vframes', '1', '-q:v', '2', str(fpath),
              '-y', '-hide_banner', '-loglevel', 'error'], check=False)
@@ -1297,6 +1472,8 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     """
     cleanup_runtime_cache()
     is_local = Path(src).exists()
+    source_url = src
+    title_hint = None
     initial_title = Path(src).stem if is_local else (src[:70] or 'video')
     sw = StatusWriter(task_id or str(uuid.uuid4())[:8], initial_title, src)
     # 注册取消机制，先于网络探测，保证 GUI 中刚启动的任务也能取消。
@@ -1309,7 +1486,11 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     try:
         sw.wait_if_paused(cancel_ev)
         threshold = screenshot_threshold(screenshot_frequency, threshold)
+        if not is_local:
+            src, source_url, title_hint = resolve_gdcvault_source(src, status=sw)
         title, duration = get_video_info(src, extra_ydl)
+        if title_hint and title.lower() in ('video', 'index'):
+            title = title_hint
     except Exception as exc:
         sw.error(str(exc))
         _cancel_events.pop(sw.task_id, None)
@@ -1396,14 +1577,19 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
             sw.update("extracting_frames", "[截图] 场景检测关键帧...", 0.76)
             sw.log(f"[截图] 场景检测关键帧（阈值={threshold}）...")
             asset_dir.mkdir(parents=True, exist_ok=True)
-            frames = extract_keyframes(video_path or Path(src), asset_dir, threshold)
+            frames = extract_keyframes(
+                video_path or Path(src),
+                asset_dir,
+                threshold,
+                min_interval=screenshot_interval(screenshot_frequency),
+            )
             sw.wait_if_paused(cancel_ev)
             sw.log(f"  → {len(frames)} 帧")
             sw.update("building_md", "[合成] 生成 Markdown...", 0.92)
             sw.log("[合成] 生成 Markdown...")
 
             print("\n[合成] 生成 Markdown...", flush=True)
-            md = build_markdown(title, src, segments or [], frames, asset_dir_name)
+            md = build_markdown(title, source_url, segments or [], frames, asset_dir_name)
             out_md.parent.mkdir(parents=True, exist_ok=True)
             out_md.write_text(md, encoding='utf-8')
 
