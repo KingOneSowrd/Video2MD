@@ -32,6 +32,7 @@ from pathlib import Path
 import yt_dlp
 
 STATUS_FILE = Path.home() / '.video2md_status.json'
+_ORIGINAL_POPEN = subprocess.Popen
 
 _BILI_RE = re.compile(r'bilibili\.com|b23\.tv', re.I)
 _YT_RE   = re.compile(r'youtube\.com|youtu\.be', re.I)
@@ -40,8 +41,13 @@ _GDC_STREAM_RE = re.compile(r'(?:gdcvault\.)?blazestreaming\.com|cdn-[^.]+\.blaz
 
 _cancel_events: dict  = {}   # task_id -> threading.Event
 _pause_events: dict   = {}   # task_id -> threading.Event (set means paused)
+_pending_pause_ids: set[str] = set()
 _status_writers: dict = {}   # task_id -> StatusWriter
 _status_lock = threading.Lock()
+_shutdown_event = threading.Event()
+_child_processes: set[subprocess.Popen] = set()
+_child_processes_lock = threading.Lock()
+_popen_tracking_installed = False
 
 
 def _subprocess_silent_kwargs() -> dict:
@@ -52,6 +58,53 @@ def _subprocess_silent_kwargs() -> dict:
     if hasattr(subprocess, 'CREATE_NO_WINDOW'):
         kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
     return kwargs
+
+
+def _register_child_process(proc: subprocess.Popen) -> subprocess.Popen:
+    with _child_processes_lock:
+        _child_processes.add(proc)
+    return proc
+
+
+def _unregister_child_process(proc: subprocess.Popen) -> None:
+    with _child_processes_lock:
+        _child_processes.discard(proc)
+
+
+def _terminate_process(proc: subprocess.Popen, timeout: float = 2.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _terminate_child_processes() -> None:
+    with _child_processes_lock:
+        procs = list(_child_processes)
+    for proc in procs:
+        _terminate_process(proc)
+        _unregister_child_process(proc)
+
+
+def _install_subprocess_tracker() -> None:
+    global _popen_tracking_installed
+    if _popen_tracking_installed:
+        return
+
+    def tracked_popen(*args, **kwargs):
+        proc = _ORIGINAL_POPEN(*args, **kwargs)
+        return _register_child_process(proc)
+
+    subprocess.Popen = tracked_popen
+    _popen_tracking_installed = True
 
 
 def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
@@ -290,10 +343,10 @@ def _running_browsers() -> set[str]:
     if sys.platform != 'win32':
         return set()
     try:
-        out = subprocess.run(
+        out = run(
             ['tasklist', '/FO', 'CSV', '/NH'],
-            capture_output=True, text=True, timeout=5,
-            **_subprocess_silent_kwargs(),
+            check=False,
+            timeout=5,
         ).stdout.lower()
         return {b for b, exe in [('chrome', 'chrome.exe'),
                                   ('edge',   'msedge.exe'),
@@ -447,6 +500,24 @@ def cleanup_runtime_cache(max_age_hours: float = 24.0) -> None:
                 shutil.rmtree(path, ignore_errors=True)
         except Exception:
             pass
+
+
+def shutdown_runtime() -> None:
+    """Cancel active work, stop helper processes, and remove runtime temp cache."""
+    _shutdown_event.set()
+    _pending_pause_ids.clear()
+    for ev in list(_pause_events.values()):
+        try:
+            ev.clear()
+        except Exception:
+            pass
+    for ev in list(_cancel_events.values()):
+        try:
+            ev.set()
+        except Exception:
+            pass
+    _terminate_child_processes()
+    cleanup_runtime_cache(max_age_hours=0)
 
 
 def _ffmpeg_bin(name: str) -> str:
@@ -643,7 +714,7 @@ def _cdp_extract_cookies(domain: str) -> 'Path | None':
         cdp_port = tmp.getsockname()[1]
 
     user_data = str(Path.home() / 'AppData/Local/Microsoft/Edge/User Data')
-    proc = subprocess.Popen(
+    proc = _register_child_process(subprocess.Popen(
         [edge_exe,
          f'--remote-debugging-port={cdp_port}',
          '--headless=new',
@@ -654,7 +725,7 @@ def _cdp_extract_cookies(domain: str) -> 'Path | None':
          'about:blank'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         **_subprocess_silent_kwargs(),
-    )
+    ))
     try:
         page_ws = None
         for _ in range(40):  # 最多等 10 秒
@@ -697,10 +768,8 @@ def _cdp_extract_cookies(domain: str) -> 'Path | None':
         return out_path
 
     finally:
-        try:
-            proc.terminate(); proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        _terminate_process(proc, timeout=5)
+        _unregister_child_process(proc)
 
 
 def _aesgcm_extract_cookies(domain: str) -> 'Path | None':
@@ -792,6 +861,7 @@ def get_youtube_cookies_file() -> 'Path | None':
 
 def cancel_task(task_id: str) -> bool:
     """取消正在处理的任务：标记 StatusWriter 不再写入，并设置 cancel 事件。"""
+    _pending_pause_ids.discard(task_id)
     sw = _status_writers.get(task_id)
     if sw:
         sw.cancelled = True
@@ -809,8 +879,13 @@ def pause_task(task_id: str) -> bool:
     """暂停正在处理的任务。"""
     pause_ev = _pause_events.get(task_id)
     sw = _status_writers.get(task_id)
-    if not pause_ev or not sw:
-        return False
+    if not pause_ev:
+        _pending_pause_ids.add(task_id)
+        return True
+    if not sw:
+        _pending_pause_ids.add(task_id)
+        pause_ev.set()
+        return True
     pause_ev.set()
     sw.pause()
     return True
@@ -818,10 +893,14 @@ def pause_task(task_id: str) -> bool:
 
 def resume_task(task_id: str) -> bool:
     """恢复正在处理的任务。"""
+    _pending_pause_ids.discard(task_id)
     pause_ev = _pause_events.get(task_id)
     sw = _status_writers.get(task_id)
-    if not pause_ev or not sw:
-        return False
+    if not pause_ev:
+        return True
+    if not sw:
+        pause_ev.clear()
+        return True
     pause_ev.clear()
     sw.resume()
     return True
@@ -981,12 +1060,33 @@ def safe_name(text: str, max_len: int = 60) -> str:
 
 
 def run(cmd, timeout=600, check=True, capture=True):
-    return subprocess.run(
-        cmd, capture_output=capture, text=True,
-        encoding='utf-8', errors='replace',
-        timeout=timeout, check=check,
+    if _shutdown_event.is_set():
+        raise RuntimeError('shutdown')
+    stdout = subprocess.PIPE if capture else None
+    stderr = subprocess.PIPE if capture else None
+    proc = _register_child_process(subprocess.Popen(
+        cmd,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
         **_subprocess_silent_kwargs(),
-    )
+    ))
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process(proc)
+        out, err = proc.communicate()
+        exc.output = out
+        exc.stderr = err
+        raise
+    finally:
+        _unregister_child_process(proc)
+    result = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if check and proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=out, stderr=err)
+    return result
 
 
 # ─────────────────────────── 视频信息 ────────────────────────────
@@ -1181,8 +1281,12 @@ def download_video(url: str, work_dir: Path, status=None,
     out_tmpl = str(work_dir / 'video.%(ext)s')
 
     def _hook(d: dict):
+        if _shutdown_event.is_set():
+            raise RuntimeError('shutdown')
         if status:
             status.wait_if_paused(_cancel_events.get(status.task_id))
+            if _cancel_events.get(status.task_id) and _cancel_events[status.task_id].is_set():
+                raise RuntimeError('cancelled')
         if d['status'] == 'downloading' and status:
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 1
             pct = d.get('downloaded_bytes', 0) / total
@@ -1366,12 +1470,11 @@ def extract_keyframes(video_path: Path, out_dir: Path,
             str(out_dir / 'frame_%05d.jpg'),
             '-hide_banner'
         ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding='utf-8', errors='replace', timeout=600,
-                                **_subprocess_silent_kwargs())
+        result = run(cmd, timeout=600, check=False)
+        combined = ((result.stdout or '') + (result.stderr or ''))
         timestamps = [
             float(m.group(1))
-            for line in result.stdout.split('\n')
+            for line in combined.split('\n')
             if (m := re.search(r'pts_time:(\d+\.?\d*)', line))
         ]
         files = sorted(out_dir.glob('frame_*.jpg'))
@@ -1502,6 +1605,9 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     供 monitor.py import 并在线程中调用。
     out_dir: 输出目录，文件名由视频标题自动生成。
     """
+    if _shutdown_event.is_set():
+        raise RuntimeError('shutdown')
+    _install_subprocess_tracker()
     cleanup_runtime_cache()
     is_local = Path(src).exists()
     source_url = src
@@ -1511,6 +1617,8 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     # 注册取消机制，先于网络探测，保证 GUI 中刚启动的任务也能取消。
     cancel_ev = threading.Event()
     pause_ev = threading.Event()
+    if sw.task_id in _pending_pause_ids:
+        pause_ev.set()
     _cancel_events[sw.task_id] = cancel_ev
     _pause_events[sw.task_id] = pause_ev
     _status_writers[sw.task_id] = sw
@@ -1527,6 +1635,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
         sw.error(str(exc))
         _cancel_events.pop(sw.task_id, None)
         _pause_events.pop(sw.task_id, None)
+        _pending_pause_ids.discard(sw.task_id)
         _status_writers.pop(sw.task_id, None)
         raise
     sw._data['title'] = title
@@ -1638,6 +1747,7 @@ def process_video(src: str, out_dir: Path, model: str = 'medium',
     finally:
         _cancel_events.pop(sw.task_id, None)
         _pause_events.pop(sw.task_id, None)
+        _pending_pause_ids.discard(sw.task_id)
         _status_writers.pop(sw.task_id, None)
 
     sw.complete(len(frames), len(segments) if segments else 0, str(out_md))

@@ -118,6 +118,45 @@ def _subprocess_silent_kwargs() -> dict:
     return kwargs
 
 
+_child_processes: set[subprocess.Popen] = set()
+_child_processes_lock = threading.Lock()
+
+
+def _run_silent(cmd: list[str], check: bool = True):
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **_subprocess_silent_kwargs(),
+    )
+    with _child_processes_lock:
+        _child_processes.add(proc)
+    try:
+        out, err = proc.communicate()
+    finally:
+        with _child_processes_lock:
+            _child_processes.discard(proc)
+    if check and proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _terminate_child_processes():
+    with _child_processes_lock:
+        procs = list(_child_processes)
+    for proc in procs:
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 # ── Window icon (programmatic) ────────────────────────────
 def make_icon() -> QIcon:
     pm = QPixmap(64, 64)
@@ -1848,6 +1887,11 @@ class MainWindow(QMainWindow):
 
     def _on_quit(self):
         self._quitting = True
+        self._pending_jobs.clear()
+        self._paused_jobs.clear()
+        _terminate_child_processes()
+        video2md.shutdown_runtime()
+        self._clear_status_file()
 
     def closeEvent(self, e):
         if self._quitting:
@@ -2083,6 +2127,9 @@ class MainWindow(QMainWindow):
                                   step_label='[暂停] 排队已暂停')
             return
         if status == 'processing' and video2md.pause_task(task_id):
+            self._append_task_log(task_id, "[暂停] 已请求暂停")
+            self._set_task_status(task_id, status='paused', step='paused',
+                                  step_label='[暂停] 等待当前步骤停住')
             self._last_sig = None
 
     def _resume_task(self, task_id: str):
@@ -2092,6 +2139,8 @@ class MainWindow(QMainWindow):
             return
         if task_id in self._active_jobs:
             if video2md.resume_task(task_id):
+                self._append_task_log(task_id, "[暂停] 已继续")
+                self._set_task_status(task_id, status='processing')
                 self._last_sig = None
             return
         with self._queue_lock:
@@ -2202,17 +2251,15 @@ class MainWindow(QMainWindow):
             else:
                 return
 
-            subprocess.run(
+            _run_silent(
                 ['git', '-C', str(repo), 'add'] + add_targets,
-                check=True, capture_output=True,
-                **_subprocess_silent_kwargs(),
+                check=True,
             )
             safe_title = _SAFE_RE.sub('_', title)[:60]
-            subprocess.run(
+            _run_silent(
                 ['git', '-C', str(repo), 'commit',
                  '-m', f'[视频摄入] {safe_title}'],
-                check=True, capture_output=True,
-                **_subprocess_silent_kwargs(),
+                check=True,
             )
         except Exception:
             pass
