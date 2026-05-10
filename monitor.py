@@ -108,6 +108,16 @@ def _glow(c, r=12):
     return fx
 
 
+def _subprocess_silent_kwargs() -> dict:
+    """Keep background helpers from flashing a console window in the Windows EXE."""
+    if sys.platform != 'win32':
+        return {}
+    kwargs = {}
+    if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
+
 # ── Window icon (programmatic) ────────────────────────────
 def make_icon() -> QIcon:
     pm = QPixmap(64, 64)
@@ -2195,12 +2205,14 @@ class MainWindow(QMainWindow):
             subprocess.run(
                 ['git', '-C', str(repo), 'add'] + add_targets,
                 check=True, capture_output=True,
+                **_subprocess_silent_kwargs(),
             )
             safe_title = _SAFE_RE.sub('_', title)[:60]
             subprocess.run(
                 ['git', '-C', str(repo), 'commit',
                  '-m', f'[视频摄入] {safe_title}'],
                 check=True, capture_output=True,
+                **_subprocess_silent_kwargs(),
             )
         except Exception:
             pass
@@ -2289,8 +2301,19 @@ class MainWindow(QMainWindow):
             esc = ln.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
             c = _css(C_PRIMARY) if ln.startswith('[') else _css(C_DIM)
             html.append(f'<span style="color:{c};">{esc}</span>')
-        self._log.setHtml('<br>'.join(html))
-        sb = self._log.verticalScrollBar(); sb.setValue(sb.maximum())
+        next_html = '<br>'.join(html)
+        if getattr(self, '_last_log_html', None) == next_html:
+            return
+        sb = self._log.verticalScrollBar()
+        old_value = sb.value()
+        was_at_bottom = (sb.maximum() - old_value) <= 4
+        self._log.setHtml(next_html)
+        self._last_log_html = next_html
+        sb = self._log.verticalScrollBar()
+        if was_at_bottom:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(old_value, sb.maximum()))
 
     def _update_stats(self, tasks):
         counts = {k: 0 for k in ("processing","paused","queued","complete","error")}

@@ -44,6 +44,16 @@ _status_writers: dict = {}   # task_id -> StatusWriter
 _status_lock = threading.Lock()
 
 
+def _subprocess_silent_kwargs() -> dict:
+    """Keep helper processes from flashing a console window in the Windows EXE."""
+    if sys.platform != 'win32':
+        return {}
+    kwargs = {}
+    if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
+
 def _ydl_opts_base(extra_args: list[str] | None = None) -> dict:
     """把旧式 yt-dlp CLI extra_args 列表转为 YoutubeDL opts dict。"""
     opts: dict = {'quiet': True, 'no_warnings': True}
@@ -282,7 +292,8 @@ def _running_browsers() -> set[str]:
     try:
         out = subprocess.run(
             ['tasklist', '/FO', 'CSV', '/NH'],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5,
+            **_subprocess_silent_kwargs(),
         ).stdout.lower()
         return {b for b, exe in [('chrome', 'chrome.exe'),
                                   ('edge',   'msedge.exe'),
@@ -642,6 +653,7 @@ def _cdp_extract_cookies(domain: str) -> 'Path | None':
          '--disable-gpu', '--log-level=3',
          'about:blank'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        **_subprocess_silent_kwargs(),
     )
     try:
         page_ws = None
@@ -894,6 +906,18 @@ class StatusWriter:
             self._data["log"] = self._data["log"][-120:]
         self._flush()
 
+    def log_replace(self, prefix: str, line: str):
+        logs = self._data["log"]
+        for i in range(len(logs) - 1, -1, -1):
+            if str(logs[i]).startswith(prefix):
+                logs[i] = line
+                break
+        else:
+            logs.append(line)
+        if len(logs) > 120:
+            self._data["log"] = logs[-120:]
+        self._flush()
+
     def complete(self, frames: int, segments: int, output_md: str):
         self._data.update(
             status="complete", step="complete", progress=1.0,
@@ -960,7 +984,8 @@ def run(cmd, timeout=600, check=True, capture=True):
     return subprocess.run(
         cmd, capture_output=capture, text=True,
         encoding='utf-8', errors='replace',
-        timeout=timeout, check=check
+        timeout=timeout, check=check,
+        **_subprocess_silent_kwargs(),
     )
 
 
@@ -1063,15 +1088,18 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
         except Exception as e:
             s = str(e)
             if '429' in s or 'Too Many Requests' in s:
+                if status:
+                    status.log("  [字幕] 请求被限流，改用 Whisper 转录。")
                 break  # 限流，静默退出，交给 Whisper
             is_browser = 'Cookie' in label
             is_retryable = bool(_YT_BOT_RE.search(s) or _BILI_AUTH_RE.search(s) or _COOKIE_ERR_RE.search(s))
             if is_browser or is_retryable:
                 if label != '默认' and status:
-                    status.log(f"  [字幕] {label} 失败，继续尝试...")
+                    status.log(f"  [字幕] {label} 失败：{s[:160]}")
+                    status.log("  [字幕] 继续尝试其他方式...")
                 continue
             if status:
-                status.log(f"  [字幕] {s[:120]}")
+                status.log(f"  [字幕] 获取失败：{s[:200]}")
             break
 
     all_sub_files = [f for f in sub_dir.glob('*') if f.suffix in ('.vtt', '.srt')]
@@ -1081,6 +1109,8 @@ def try_platform_subtitles(url: str, work_dir: Path, status=None,
             status.log(f"  [字幕] 已下载文件: {[f.name for f in all_downloaded]}")
     if not all_sub_files:
         print("  → 无平台字幕，将使用 Whisper。", flush=True)
+        if status:
+            status.log("  [字幕] 未获取到平台字幕，改用 Whisper 转录。")
         return None
 
     # 优先取中文字幕
@@ -1156,8 +1186,9 @@ def download_video(url: str, work_dir: Path, status=None,
         if d['status'] == 'downloading' and status:
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 1
             pct = d.get('downloaded_bytes', 0) / total
-            status.update('downloading', f"[下载] {pct:.0%}", 0.04 + pct * 0.20)
-            status.log(f"  [下载] {pct:.0%}")
+            pct_text = f"{pct:.0%}"
+            status.update('downloading', f"下载中：{pct_text}", 0.04 + pct * 0.20)
+            status.log_replace("下载中：", f"下载中：{pct_text}")
         elif d['status'] == 'finished' and status:
             info = d.get('info_dict', {})
             w, h = info.get('width'), info.get('height')
@@ -1336,7 +1367,8 @@ def extract_keyframes(video_path: Path, out_dir: Path,
             '-hide_banner'
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding='utf-8', errors='replace', timeout=600)
+                                text=True, encoding='utf-8', errors='replace', timeout=600,
+                                **_subprocess_silent_kwargs())
         timestamps = [
             float(m.group(1))
             for line in result.stdout.split('\n')
